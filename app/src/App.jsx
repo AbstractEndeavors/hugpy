@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import ModelTable from './components/ModelTable'
 import ChatPanel from './components/ChatPanel'
+import AddFromHF from './components/AddFromHF'
+import PeersBar from './components/PeersBar'
 import './App.css'
 
 export default function App() {
@@ -60,6 +62,23 @@ export default function App() {
   const jobsByModel = {}
   Object.values(jobs).forEach(j => { jobsByModel[j.model_key] = j })
 
+  // Adapter — the freeform /llm/repos/download endpoint returns Job.to_dict() with
+  // `id` (not `job_id`). Normalize before slotting into the existing jobs map.
+  const handleHFJobStarted = useCallback((rawJob) => {
+    const jobId = rawJob.job_id ?? rawJob.id
+    if (!jobId) return
+    setJobs(prev => ({
+      ...prev,
+      [jobId]: {
+        job_id: jobId,
+        model_key: rawJob.model_key,
+        status: rawJob.status ?? 'queued',
+        message: rawJob.message ?? '',
+      },
+    }))
+    refreshModels()
+  }, [refreshModels])
+
   return (
     <div className="layout">
       <header className="topbar">
@@ -72,6 +91,9 @@ export default function App() {
           <button onClick={refreshModels} title="Refresh model list">↻</button>
         </div>
       </header>
+
+      <PeersBar />
+      <AddFromHF onJobStarted={handleHFJobStarted} />
 
       <div className="body">
         <section className="models-pane" data-chat-open={!!activeChat}>

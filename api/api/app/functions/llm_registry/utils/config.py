@@ -3,8 +3,8 @@ from pydantic import BaseModel
 
 
 class Settings(BaseModel):
-    storage_root: Path = Path("/mnt/llm_storage")
-    manifest_path: Path = Path("/mnt/llm_storage/projects/model_manifest.json")
+    storage_root: Path = Path("/mnt/llm_registry")
+    manifest_path: Path = Path("/mnt/llm_registry/projects/model_manifest.json")
 
     @property
     def hf_home(self) -> Path:
