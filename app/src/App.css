@@ -1,0 +1,41 @@
+.layout {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ── top bar ──────────────────────────────────────────────────────────── */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.logo { font-size: 15px; font-weight: 700; color: var(--bright); letter-spacing: 0.03em; }
+.topbar-right { display: flex; gap: 8px; align-items: center; }
+
+/* ── body ─────────────────────────────────────────────────────────────── */
+.body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.models-pane {
+  flex: 1;
+  overflow: auto;
+  padding: 16px 20px;
+  transition: flex 0.2s;
+}
+.models-pane[data-chat-open="true"] { flex: 0 0 56%; }
+
+.placeholder {
+  text-align: center;
+  color: var(--muted);
+  padding: 60px 0;
+}
+.placeholder.error { color: var(--red); }
