@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
+import { apiUrl } from '../api'
 import './ChatPanel.css'
 
 const PLACEHOLDER_CMDS = '/system <text> · /clear · /tokens <N>'
@@ -95,7 +96,7 @@ export default function ChatPanel({ modelKey, model, onClose }) {
     setMessages(prev => [...prev, { role: 'assistant', content: '' }])
 
     try {
-      const resp = await fetch('/api/chat/stream', {
+      const resp = await fetch(apiUrl('/chat/stream'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),

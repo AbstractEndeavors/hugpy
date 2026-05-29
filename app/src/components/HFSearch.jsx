@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { apiUrl } from '../api'
 import './HFSearch.css'
 
 const TASK_FILTERS = [
@@ -52,7 +53,7 @@ export default function HFSearch({ onJobStarted, pendingByHub }) {
     const timer = setTimeout(() => {
       const params = new URLSearchParams({ q, limit: '20' })
       if (taskFilter) params.set('task', taskFilter)
-      fetch(`/api/search?${params.toString()}`)
+      fetch(apiUrl(`/search?${params.toString()}`))
         .then(r => {
           if (!r.ok) throw new Error(`HTTP ${r.status}`)
           return r.json()
@@ -85,7 +86,7 @@ export default function HFSearch({ onJobStarted, pendingByHub }) {
         task: inferTask(result),
         register: true,
       }
-      const resp = await fetch('/api/llm/repos/download', {
+      const resp = await fetch(apiUrl('/llm/repos/download'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),

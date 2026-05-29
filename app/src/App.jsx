@@ -4,6 +4,7 @@ import ChatPanel from './components/ChatPanel'
 import AddFromHF from './components/AddFromHF'
 import HFSearch from './components/HFSearch'
 import PeersBar from './components/PeersBar'
+import { apiUrl } from './api'
 import './App.css'
 
 export default function App() {
@@ -16,7 +17,7 @@ export default function App() {
 
   // ── fetch model list ────────────────────────────────────────────────────
   const refreshModels = useCallback(() => {
-    fetch('/api/models')
+    fetch(apiUrl('/models'))
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() })
       .then(data => { setModels(data); setLoading(false); setError(null) })
       .catch(e => { setError(e.message); setLoading(false) })
@@ -30,7 +31,7 @@ export default function App() {
     if (!active.length) return
     const timer = setInterval(() => {
       active.forEach(j => {
-        fetch(`/api/jobs/${j.job_id}`)
+        fetch(apiUrl(`/jobs/${j.job_id}`))
           .then(r => r.json())
           .then(updated => {
             setJobs(prev => ({ ...prev, [updated.job_id]: updated }))
@@ -44,7 +45,7 @@ export default function App() {
 
   // ── actions ─────────────────────────────────────────────────────────────
   const handleDownload = useCallback((modelKey) => {
-    fetch(`/api/models/${encodeURIComponent(modelKey)}/download`, { method: 'POST' })
+    fetch(apiUrl(`/models/${encodeURIComponent(modelKey)}/download`), { method: 'POST' })
       .then(r => r.json())
       .then(data => setJobs(prev => ({
         ...prev,

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { apiUrl } from '../api'
 import './PeersBar.css'
 
 function fmtBytes(n) {
@@ -17,7 +18,7 @@ export default function PeersBar() {
   useEffect(() => {
     let cancelled = false
     const load = () => {
-      fetch('/api/llm/peers')
+      fetch(apiUrl('/llm/peers'))
         .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() })
         .then(data => { if (!cancelled) { setPeers(data); setError(null) } })
         .catch(e => { if (!cancelled) setError(e.message) })
