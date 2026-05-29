@@ -3,22 +3,59 @@ import './ChatPanel.css'
 
 const PLACEHOLDER_CMDS = '/system <text> · /clear · /tokens <N>'
 
+function isVLModel(model) {
+  if (!model) return false
+  const task = model.primary_task || model.task
+  return task === 'image-text-to-text'
+}
+
+function readFileAsDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader()
+    r.onload = () => resolve({ name: file.name, dataUrl: r.result })
+    r.onerror = () => reject(r.error)
+    r.readAsDataURL(file)
+  })
+}
+
+function stripDataUrl(dataUrl) {
+  const i = dataUrl.indexOf(',')
+  return i >= 0 ? dataUrl.slice(i + 1) : dataUrl
+}
+
 export default function ChatPanel({ modelKey, model, onClose }) {
   const [messages, setMessages]     = useState([])     // {role, content}
   const [input, setInput]           = useState('')
   const [system, setSystem]         = useState('')
   const [maxTokens, setMaxTokens]   = useState(2048)
   const [streaming, setStreaming]   = useState(false)
+  const [attachment, setAttachment] = useState(null)   // {name, dataUrl} | null
   const bottomRef = useRef(null)
   const inputRef  = useRef(null)
+  const fileRef   = useRef(null)
+
+  const vlCapable = isVLModel(model)
 
   useEffect(() => { inputRef.current?.focus() }, [modelKey])
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+  useEffect(() => { if (!vlCapable) setAttachment(null) }, [vlCapable])
+
+  const onPickFile = useCallback(async (e) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    try {
+      const att = await readFileAsDataURL(file)
+      setAttachment(att)
+    } catch (err) {
+      alert(`Could not read file: ${err?.message ?? err}`)
+    }
+  }, [])
 
   // ── send ────────────────────────────────────────────────────────────────
   const send = useCallback(async () => {
     const text = input.trim()
-    if (!text || streaming) return
+    if ((!text && !attachment) || streaming) return
     setInput('')
 
     // slash-commands
@@ -30,17 +67,27 @@ export default function ChatPanel({ modelKey, model, onClose }) {
       return
     }
 
-    const userMsg = { role: 'user', content: text }
+    const pendingAttachment = attachment
+    const userMsg = pendingAttachment
+      ? { role: 'user', content: text, attachment: pendingAttachment }
+      : { role: 'user', content: text }
+
     const history = [...messages, userMsg]
     setMessages(history)
+    setAttachment(null)
     setStreaming(true)
 
-    // Build full message list (with optional system prompt)
+    const wireMessages = history.map(({ role, content, attachment: att }) => {
+      const base = { role, content }
+      if (att) base.images = [stripDataUrl(att.dataUrl)]
+      return base
+    })
+
     const payload = {
       model_key: modelKey,
       messages: system
-        ? [{ role: 'system', content: system }, ...history]
-        : history,
+        ? [{ role: 'system', content: system }, ...wireMessages]
+        : wireMessages,
       max_new_tokens: maxTokens,
     }
 
@@ -112,7 +159,7 @@ export default function ChatPanel({ modelKey, model, onClose }) {
     } finally {
       setStreaming(false)
     }
-  }, [input, messages, modelKey, system, maxTokens, streaming])
+  }, [input, attachment, messages, modelKey, system, maxTokens, streaming])
 
   const onKey = useCallback((e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
@@ -128,6 +175,7 @@ export default function ChatPanel({ modelKey, model, onClose }) {
             {model?.framework} · {model?.primary_task}
             {system && <span className="system-set" title={system}> · sys</span>}
             {' · '}max {maxTokens} tok
+            {vlCapable && <span className="vl-tag" title="vision-language model"> · 🖼 VL</span>}
           </span>
         </div>
         <div className="chat-header-right">
@@ -149,11 +197,20 @@ export default function ChatPanel({ modelKey, model, onClose }) {
           <div className="chat-empty">
             <p>Chat with <strong>{model?.name ?? modelKey}</strong></p>
             <p className="chat-hint">Commands: {PLACEHOLDER_CMDS}</p>
+            {vlCapable && <p className="chat-hint">Attach an image with the 📎 button.</p>}
           </div>
         )}
         {messages.map((msg, i) => (
           <div key={i} className={`msg msg-${msg.role} ${msg.error ? 'msg-error' : ''}`}>
             <span className="msg-role">{msg.role}</span>
+            {msg.attachment && (
+              <img
+                className="msg-thumb"
+                src={msg.attachment.dataUrl}
+                alt={msg.attachment.name}
+                title={msg.attachment.name}
+              />
+            )}
             <pre className="msg-content">{msg.content}
               {msg.role === 'assistant' && streaming && i === messages.length - 1 && (
                 <span className="cursor">▌</span>
@@ -164,8 +221,35 @@ export default function ChatPanel({ modelKey, model, onClose }) {
         <div ref={bottomRef} />
       </div>
 
+      {/* attachment preview */}
+      {attachment && (
+        <div className="attach-strip">
+          <img src={attachment.dataUrl} alt={attachment.name} className="attach-thumb" />
+          <span className="attach-name" title={attachment.name}>{attachment.name}</span>
+          <button
+            className="attach-remove"
+            onClick={() => setAttachment(null)}
+            disabled={streaming}
+            title="Remove attachment"
+          >×</button>
+        </div>
+      )}
+
       {/* input */}
       <div className="chat-input-row">
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/*"
+          style={{ display: 'none' }}
+          onChange={onPickFile}
+        />
+        <button
+          className="btn-attach"
+          onClick={() => fileRef.current?.click()}
+          disabled={!vlCapable || streaming}
+          title={vlCapable ? 'Attach image' : 'Selected model does not accept images'}
+        >📎</button>
         <textarea
           ref={inputRef}
           className="chat-input"
@@ -179,7 +263,7 @@ export default function ChatPanel({ modelKey, model, onClose }) {
         <button
           className="btn-send"
           onClick={send}
-          disabled={!input.trim() || streaming}
+          disabled={(!input.trim() && !attachment) || streaming}
         >
           {streaming ? '…' : '↑ Send'}
         </button>

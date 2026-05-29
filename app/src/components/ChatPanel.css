@@ -175,3 +175,60 @@
 }
 .btn-send:hover:not(:disabled) { background: #7be5f5; border-color: #7be5f5; }
 .btn-send:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── attachment ──────────────────────────────────────────────────────── */
+.btn-attach {
+  padding: 8px 10px;
+  font-size: 14px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+}
+.btn-attach:hover:not(:disabled) { border-color: var(--cyan); }
+.btn-attach:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.vl-tag { color: var(--cyan); }
+
+.attach-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-top: 1px solid var(--border);
+  background: rgba(86, 212, 232, 0.04);
+  font-size: 12px;
+}
+.attach-thumb {
+  width: 40px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+.attach-name {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+.attach-remove {
+  padding: 2px 8px;
+  font-size: 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.attach-remove:hover:not(:disabled) { color: var(--red); border-color: var(--red); }
+
+.msg-thumb {
+  max-width: 200px;
+  max-height: 200px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  align-self: flex-start;
+}

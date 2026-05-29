@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 from .init_imports import *
 class Message(BaseModel):
     role: str
     content: str
+    images: List[str] | None = None
 
 
 class ChatBody(BaseModel):
