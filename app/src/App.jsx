@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import ModelTable from './components/ModelTable'
 import ChatPanel from './components/ChatPanel'
 import AddFromHF from './components/AddFromHF'
+import HFSearch from './components/HFSearch'
 import PeersBar from './components/PeersBar'
 import './App.css'
 
@@ -64,6 +65,7 @@ export default function App() {
 
   // Adapter — the freeform /llm/repos/download endpoint returns Job.to_dict() with
   // `id` (not `job_id`). Normalize before slotting into the existing jobs map.
+  // hub_id is tagged here so HFSearch can mark its row as queued.
   const handleHFJobStarted = useCallback((rawJob) => {
     const jobId = rawJob.job_id ?? rawJob.id
     if (!jobId) return
@@ -72,12 +74,20 @@ export default function App() {
       [jobId]: {
         job_id: jobId,
         model_key: rawJob.model_key,
+        hub_id: rawJob.hub_id,
         status: rawJob.status ?? 'queued',
         message: rawJob.message ?? '',
       },
     }))
     refreshModels()
   }, [refreshModels])
+
+  // Map hub_id -> true for any in-flight or completed-this-session pull,
+  // plus everything currently installed. HFSearch uses this to dim its Pull
+  // button so users don't queue dupes.
+  const pendingByHub = {}
+  Object.values(jobs).forEach(j => { if (j.hub_id) pendingByHub[j.hub_id] = true })
+  models.forEach(m => { if (m.hub_id && m.installed) pendingByHub[m.hub_id] = true })
 
   return (
     <div className="layout">
@@ -93,6 +103,7 @@ export default function App() {
       </header>
 
       <PeersBar />
+      <HFSearch onJobStarted={handleHFJobStarted} pendingByHub={pendingByHub} />
       <AddFromHF onJobStarted={handleHFJobStarted} />
 
       <div className="body">
