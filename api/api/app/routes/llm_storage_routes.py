@@ -46,8 +46,16 @@ def list_models():
         values = {
             "key": key,
             "name": model.get("name"),
-                            "hub_id": model.get("hub_id"),
-                            "framework": model.get("framework"),"task": model.get("task"),"filename": model.get("filename"),"include": model.get("include"),**status}
+            "hub_id": model.get("hub_id"),
+            "framework": model.get("framework"),
+            "primary_task": model.get("primary_task"),
+            "tasks": model.get("tasks", []),
+            "model_max_length": model.get("model_max_length"),
+            "filename": model.get("filename"),
+            "include": model.get("include"),
+            "port": model.get("port"),
+            **status,
+        }
         output.append(values)
 
     return jsonify(output)
@@ -56,7 +64,6 @@ def list_models():
 @llm_bp.route("/models/<model_key>", methods=["GET"])
 def get_model(model_key):
     manifest = get_models_dict(dict_return=True)
-    logger.info(manifest)
     if model_key not in manifest:
         abort(404, description="Unknown model key.")
 
@@ -71,8 +78,7 @@ def get_model(model_key):
 
 @llm_bp.route("/models/<model_key>/download", methods=["POST"])
 def start_download(model_key):
-    manifest = get_model_config(model_key,dict_return=True)
-    manifest = manifest
+    manifest = get_models_dict(dict_return=True)
     if model_key not in manifest:
         abort(404, description="Unknown model key.")
 
@@ -167,7 +173,7 @@ def download_repo():
 
 @llm_bp.route("/models/<model_key>", methods=["DELETE"])
 def delete_model(model_key):
-    manifest = get_model_config(dict_return=True)
+    manifest = get_models_dict(dict_return=True)
 
     if model_key not in manifest:
         abort(404, description="Unknown model key.")

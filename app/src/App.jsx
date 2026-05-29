@@ -65,9 +65,9 @@ export default function App() {
   }, [refreshModels])
 
   // ── derived state ────────────────────────────────────────────────────────
-  const allTasks = [...new Set(models.map(m => m.task).filter(Boolean))]
+  const allTasks = [...new Set(models.flatMap(m => m.tasks ?? []))]
   const displayed = filterTask
-    ? models.filter(m => m.task === filterTask)
+    ? models.filter(m => (m.tasks ?? []).includes(filterTask))
     : models
   const jobsByModel = {}
   Object.values(jobs).forEach(j => { jobsByModel[j.model_key] = j })

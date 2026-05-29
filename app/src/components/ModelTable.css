@@ -38,6 +38,7 @@
 .col-num   { color: var(--muted); width: 36px; text-align: right; }
 .col-name  { min-width: 220px; }
 .col-task  { color: var(--text); white-space: nowrap; }
+.col-ctx   { color: var(--muted); white-space: nowrap; text-align: right; width: 52px; }
 .col-actions { white-space: nowrap; width: 64px; position: relative; text-align: right; }
 
 .model-name {
