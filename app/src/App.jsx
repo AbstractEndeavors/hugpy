@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
+import { fetchJson } from './api'
 import ModelTable from './components/ModelTable'
 import ChatPanel from './components/ChatPanel'
 import AddFromHF from './components/AddFromHF'
@@ -16,8 +17,7 @@ export default function App() {
 
   // ── fetch model list ────────────────────────────────────────────────────
   const refreshModels = useCallback(() => {
-    fetch('/api/models')
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() })
+    fetchJson('/api/models')
       .then(data => { setModels(data); setLoading(false); setError(null) })
       .catch(e => { setError(e.message); setLoading(false) })
   }, [])
@@ -30,8 +30,7 @@ export default function App() {
     if (!active.length) return
     const timer = setInterval(() => {
       active.forEach(j => {
-        fetch(`/api/jobs/${j.job_id}`)
-          .then(r => r.json())
+        fetchJson(`/api/jobs/${j.job_id}`)
           .then(updated => {
             setJobs(prev => ({ ...prev, [updated.job_id]: updated }))
             if (updated.status === 'done') refreshModels()
@@ -44,8 +43,7 @@ export default function App() {
 
   // ── actions ─────────────────────────────────────────────────────────────
   const handleDownload = useCallback((modelKey) => {
-    fetch(`/api/models/${encodeURIComponent(modelKey)}/download`, { method: 'POST' })
-      .then(r => r.json())
+    fetchJson(`/api/models/${encodeURIComponent(modelKey)}/download`, { method: 'POST' })
       .then(data => setJobs(prev => ({
         ...prev,
         [data.job_id]: { job_id: data.job_id, model_key: modelKey, status: 'queued', message: '' }

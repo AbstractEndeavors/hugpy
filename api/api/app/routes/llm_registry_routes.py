@@ -1,4 +1,9 @@
+import os
+import shutil
+import threading
+
 from pydantic import BaseModel, Field
+from flask import request, jsonify, abort
 
 from ..functions import *
 from ..functions.llm_registry import *
@@ -17,21 +22,21 @@ class HFRepoDownloadRequest(BaseModel):
     register: bool = True
 
 @llm_bp.route("/health", methods=["GET"])
-def health() -> dict:
-    return {
+def health():
+    return jsonify({
         "ok": True,
         "storage_root": str(settings.storage_root),
         "manifest_path": str(settings.manifest_path),
-    }
+    })
 
 
 @llm_bp.route("/llm/peers", methods=["GET"])
-def peers() -> list[dict]:
-    return list_peers()
+def peers():
+    return jsonify(list_peers())
 
 
 @llm_bp.route("/models", methods=["GET"])
-def list_models() -> list[dict]:
+def list_models():
     manifest = get_manifest()
     output = []
 
@@ -51,31 +56,31 @@ def list_models() -> list[dict]:
             }
         )
 
-    return output
+    return jsonify(output)
 
 
-@llm_bp.route("/models/{model_key}", methods=["GET"])
-def get_model(model_key: str) -> dict:
+@llm_bp.route("/models/<model_key>", methods=["GET"])
+def get_model(model_key):
     manifest = get_manifest()
 
     if model_key not in manifest:
-        raise HTTPException(status_code=404, detail="Unknown model key.")
+        abort(404, description="Unknown model key.")
 
     model = manifest[model_key]
 
-    return {
+    return jsonify({
         "key": model_key,
         **model,
         **model_status(model),
-    }
+    })
 
 
-@llm_bp.route("/models/{model_key}/download", methods=["POST"])
-def start_download(model_key: str) -> dict:
+@llm_bp.route("/models/<model_key>/download", methods=["POST"])
+def start_download(model_key):
     manifest = get_manifest()
 
     if model_key not in manifest:
-        raise HTTPException(status_code=404, detail="Unknown model key.")
+        abort(404, description="Unknown model key.")
 
     model = manifest[model_key]
     job = job_store.create(model_key)
@@ -100,31 +105,32 @@ def start_download(model_key: str) -> dict:
     thread = threading.Thread(target=runner, daemon=True)
     thread.start()
 
-    return job.to_dict()
+    return jsonify(job.to_dict())
 
 
 @llm_bp.route("/jobs", methods=["GET"])
-def list_jobs() -> list[dict]:
-    return [job.to_dict() for job in job_store.all()]
+def list_jobs():
+    return jsonify([job.to_dict() for job in job_store.all()])
 
 
-@llm_bp.route("/jobs/{job_id}", methods=["GET"])
-def get_job(job_id: str) -> dict:
+@llm_bp.route("/jobs/<job_id>", methods=["GET"])
+def get_job(job_id):
     job = job_store.get(job_id)
 
     if not job:
-        raise HTTPException(status_code=404, detail="Unknown job ID.")
+        abort(404, description="Unknown job ID.")
 
-    return job.to_dict()
+    return jsonify(job.to_dict())
 
 
 @llm_bp.route("/llm/repos/download", methods=["GET"])
-def download_repo(body: HFRepoDownloadRequest) -> dict:
+def download_repo():
     """Acquire any Hugging Face repo by hub_id without a pre-registered manifest entry.
 
     If register=True, the model is added to the manifest so it appears in the
     registry browser on the next refresh.
     """
+    body = HFRepoDownloadRequest(**(request.get_json(silent=True) or {}))
     model = {
         "name": body.name or body.hub_id.split("/")[-1],
         "hub_id": body.hub_id,
@@ -162,28 +168,28 @@ def download_repo(body: HFRepoDownloadRequest) -> dict:
     thread = threading.Thread(target=runner, daemon=True)
     thread.start()
 
-    return {**job.to_dict(), "model_key": model_key}
+    return jsonify({**job.to_dict(), "model_key": model_key})
 
 
-@llm_bp.route("/models/{model_key}", methods=["DELETE"])
-def delete_model(model_key: str) -> dict:
+@llm_bp.route("/models/<model_key>", methods=["DELETE"])
+def delete_model(model_key):
     manifest = get_manifest()
 
     if model_key not in manifest:
-        raise HTTPException(status_code=404, detail="Unknown model key.")
+        abort(404, description="Unknown model key.")
 
     destination = model_destination(settings.storage_root, manifest[model_key])
 
-    if not destination.exists():
-        return {
+    if not os.path.exists(destination):
+        return jsonify({
             "deleted": False,
             "message": "Model is not installed.",
             "destination": str(destination),
-        }
+        })
 
     shutil.rmtree(destination)
 
-    return {
+    return jsonify({
         "deleted": True,
         "destination": str(destination),
-    }
+    })

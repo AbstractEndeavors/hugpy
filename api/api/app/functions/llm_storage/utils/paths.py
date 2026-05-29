@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import os
 import re
-from pathlib import Path
 from typing import Any
 
 
@@ -48,7 +48,7 @@ def framework_family(model: dict[str, Any]) -> str:
     return "misc"
 
 
-def model_destination(storage_root: Path, model: dict[str, Any]) -> Path:
+def model_destination(storage_root: str, model: dict[str, Any]) -> str:
     hub_id = model.get("hub_id") or model.get("folder") or model.get("name")
 
     if not hub_id:
@@ -59,10 +59,10 @@ def model_destination(storage_root: Path, model: dict[str, Any]) -> Path:
     family = framework_family(model)
 
     if family == "datasets":
-        return storage_root / "datasets" / hub_path
+        return os.path.join(storage_root, "datasets", hub_path)
 
-    return storage_root / "models" / family / task / hub_path
+    return os.path.join(storage_root, "models", family, task, hub_path)
 
 
-def install_marker(destination: Path) -> Path:
-    return destination / ".llm_storage_installed.json"
+def install_marker(destination: str) -> str:
+    return os.path.join(destination, ".llm_storage_installed.json")

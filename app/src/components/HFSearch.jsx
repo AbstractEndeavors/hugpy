@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { fetchJson } from '../api'
 import './HFSearch.css'
 
 const TASK_FILTERS = [
@@ -52,11 +53,7 @@ export default function HFSearch({ onJobStarted, pendingByHub }) {
     const timer = setTimeout(() => {
       const params = new URLSearchParams({ q, limit: '20' })
       if (taskFilter) params.set('task', taskFilter)
-      fetch(`/api/search?${params.toString()}`)
-        .then(r => {
-          if (!r.ok) throw new Error(`HTTP ${r.status}`)
-          return r.json()
-        })
+      fetchJson(`/api/search?${params.toString()}`)
         .then(data => {
           if (myReq !== reqIdRef.current) return
           setResults(Array.isArray(data) ? data : [])
@@ -85,13 +82,11 @@ export default function HFSearch({ onJobStarted, pendingByHub }) {
         task: inferTask(result),
         register: true,
       }
-      const resp = await fetch('/api/llm/repos/download', {
+      const job = await fetchJson('/api/llm/repos/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`)
-      const job = await resp.json()
       onJobStarted?.({ ...job, hub_id: result.hub_id })
     } catch (e) {
       alert(`Pull failed for ${result.hub_id}: ${e.message}`)

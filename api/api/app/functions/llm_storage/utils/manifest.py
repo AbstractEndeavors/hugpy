@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import re
-from pathlib import Path
 from typing import Any
 
 
-def load_manifest(path: Path) -> dict[str, dict[str, Any]]:
-    if not path.exists():
+def load_manifest(path: str) -> dict[str, dict[str, Any]]:
+    if not os.path.exists(path):
         raise FileNotFoundError(f"Manifest not found: {path}")
 
-    with path.open("r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     if not isinstance(data, dict):
@@ -19,15 +19,17 @@ def load_manifest(path: Path) -> dict[str, dict[str, Any]]:
     return data
 
 
-def load_manifest_or_empty(path: Path) -> dict[str, dict[str, Any]]:
-    if not path.exists():
+def load_manifest_or_empty(path: str) -> dict[str, dict[str, Any]]:
+    if not os.path.exists(path):
         return {}
     return load_manifest(path)
 
 
-def save_manifest(path: Path, manifest: dict[str, dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+def save_manifest(path: str, manifest: dict[str, dict[str, Any]]) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
 
 
@@ -37,7 +39,7 @@ def key_for_hub_id(hub_id: str) -> str:
 
 
 def upsert_model(
-    path: Path,
+    path: str,
     model: dict[str, Any],
     *,
     key: str | None = None,

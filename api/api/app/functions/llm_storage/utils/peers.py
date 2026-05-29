@@ -3,15 +3,14 @@ from __future__ import annotations
 import os
 import shutil
 import socket
-from pathlib import Path
 from typing import Any
 
 from .config import settings
 
 
-def _disk(path: Path) -> dict[str, int | None]:
+def _disk(path: str) -> dict[str, int | None]:
     try:
-        usage = shutil.disk_usage(path if path.exists() else path.anchor or "/")
+        usage = shutil.disk_usage(path if os.path.exists(path) else "/")
         return {"total": usage.total, "used": usage.used, "free": usage.free}
     except OSError:
         return {"total": None, "used": None, "free": None}
@@ -34,7 +33,7 @@ def describe_self() -> dict[str, Any]:
         "role": role,
         "storage_root": str(settings.storage_root),
         "manifest_path": str(settings.manifest_path),
-        "storage_mounted": settings.storage_root.exists(),
+        "storage_mounted": os.path.exists(settings.storage_root),
         "disk": _disk(settings.storage_root),
         "status": "online",
     }

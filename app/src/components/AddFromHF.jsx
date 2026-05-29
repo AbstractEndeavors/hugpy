@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { fetchJson } from '../api'
 import './AddFromHF.css'
 
 const FRAMEWORKS = ['transformers', 'llama_cpp', 'dataset']
@@ -28,7 +29,7 @@ export default function AddFromHF({ onJobStarted }) {
     setSubmitting(true)
     setError(null)
     try {
-      const resp = await fetch('/api/llm/repos/download', {
+      const job = await fetchJson('/api/llm/repos/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -39,10 +40,6 @@ export default function AddFromHF({ onJobStarted }) {
           register: true,
         }),
       })
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}: ${await resp.text()}`)
-      }
-      const job = await resp.json()
       onJobStarted?.(job)
       setHubId('')
       setFilename('')

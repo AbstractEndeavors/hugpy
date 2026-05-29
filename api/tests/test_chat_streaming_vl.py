@@ -11,15 +11,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import types
 import unittest
-from pathlib import Path
 
 
 # Make the api package importable
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent / "api"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "api"))
 
 
 def _install_stubs():
@@ -155,13 +155,13 @@ class VLBranchTests(unittest.TestCase):
         # abstract_flask-based app package to be importable.
         import importlib.util
 
-        path = (
-            HERE.parent
-            / "api"
-            / "app"
-            / "functions"
-            / "chat"
-            / "streaming.py"
+        path = os.path.join(
+            os.path.dirname(HERE),
+            "api",
+            "app",
+            "functions",
+            "chat",
+            "streaming.py",
         )
         # The module does `from .imports import *`; satisfy that by stubbing
         # what it needs from the imports surface.
@@ -182,10 +182,11 @@ class VLBranchTests(unittest.TestCase):
         sys.modules["_vl_test_pkg"] = pkg
         sys.modules["_vl_test_pkg.imports"] = stub_imports
 
-        src = path.read_text()
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
         src = src.replace("from .imports import *", "from _vl_test_pkg.imports import *")
         mod = types.ModuleType("_vl_streaming_under_test")
-        exec(compile(src, str(path), "exec"), mod.__dict__)
+        exec(compile(src, path, "exec"), mod.__dict__)
         return mod.stream_events
 
     def test_vl_branch_with_image(self):

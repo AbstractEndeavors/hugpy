@@ -4,8 +4,6 @@ import threading
 import uuid
 from typing import Any, Dict
 
-from fastapi import APIRouter, HTTPException
-
 try:
     from abstract_hugpy.imports.config.models_dict import MODELS
     from abstract_hugpy.console import is_installed, destination_for, download_model
@@ -16,8 +14,7 @@ except ImportError:
         return False
 
     def destination_for(m):
-        from pathlib import Path
-        return Path("/unknown")
+        return "/unknown"
 
     def download_model(key, model):
         raise RuntimeError("abstract_hugpy not installed")

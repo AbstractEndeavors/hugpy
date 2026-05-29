@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json,os
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from huggingface_hub import hf_hub_download, snapshot_download
@@ -22,9 +21,9 @@ def model_status(model: dict[str, Any]) -> dict[str, Any]:
     destination = model_destination(settings.storage_root, model)
     marker = install_marker(destination)
 
-    if marker.exists():
+    if os.path.exists(marker):
         status = "installed"
-    elif destination.exists() and any(destination.iterdir()):
+    elif os.path.exists(destination) and os.listdir(destination):
         status = "partial"
     else:
         status = "not_installed"
@@ -36,7 +35,7 @@ def model_status(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def write_install_marker(destination: Path, model_key: str, model: dict[str, Any]) -> None:
+def write_install_marker(destination: str, model_key: str, model: dict[str, Any]) -> None:
     marker = install_marker(destination)
     payload = {
         "model_key": model_key,
@@ -48,10 +47,11 @@ def write_install_marker(destination: Path, model_key: str, model: dict[str, Any
         "installed_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write(json.dumps(payload, indent=2))
 
 
-def download_model(model_key: str, model: dict[str, Any]) -> Path:
+def download_model(model_key: str, model: dict[str, Any]) -> str:
     configure_environment()
 
     hub_id = model.get("hub_id")
@@ -59,7 +59,7 @@ def download_model(model_key: str, model: dict[str, Any]) -> Path:
         raise ValueError(f"{model_key} is missing hub_id.")
 
     destination = model_destination(settings.storage_root, model)
-    destination.mkdir(parents=True, exist_ok=True)
+    os.makedirs(destination, exist_ok=True)
 
     repo_id, subfolder = split_hub_id(hub_id)
 
