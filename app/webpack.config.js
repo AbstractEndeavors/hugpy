@@ -11,6 +11,11 @@ const __dirname = path.dirname(__filename)
 // For prod, build with API_BASE=https://api.abstractgpt.ai.
 const API_BASE = process.env.API_BASE || '/api'
 
+// PUBLIC_PATH controls where webpack-emitted assets are served from. Default
+// '/' suits abstractgpt.ai (root). For llm.abstractgpt.ai/app/ build with
+// PUBLIC_PATH=/app/ so /assets/... resolves under the /app/ prefix.
+const PUBLIC_PATH = process.env.PUBLIC_PATH || '/'
+
 export default {
   entry: './src/main.jsx',
 
@@ -18,7 +23,7 @@ export default {
     path: path.resolve(__dirname, 'dist'),
     filename: 'assets/[name].[contenthash].js',
     clean: true,
-    publicPath: '/',
+    publicPath: PUBLIC_PATH,
   },
 
   resolve: {

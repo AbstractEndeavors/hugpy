@@ -1,0 +1,44 @@
+[Unit]
+Description=AbstractGPT API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+User=abstractgpt
+Group=abstractgpt
+
+WorkingDirectory=/srv/abstractgpt/api/api
+
+Environment=HOME=/srv/abstractgpt
+Environment=USER=abstractgpt
+
+# Shared LLM registry — canonical mount point for every node in the workspace.
+# abstract_hugpy reads DEFAULT_ROOT directly; the HF / transformers / torch
+# caches all live underneath it so any snapshot_download or from_pretrained
+# call from any service lands in the shared registry.
+Environment=DEFAULT_ROOT=/mnt/llm_registry
+Environment=LLM_STORAGE=/mnt/llm_registry
+Environment=HF_HOME=/mnt/llm_registry/cache/huggingface
+Environment=HF_HUB_CACHE=/mnt/llm_registry/cache/huggingface/hub
+Environment=TRANSFORMERS_CACHE=/mnt/llm_registry/cache/huggingface/transformers
+Environment=TORCH_HOME=/mnt/llm_registry/cache/torch
+Environment=PIP_CACHE_DIR=/mnt/llm_registry/cache/pip
+Environment=LLAMA_CPP_MODEL_DIR=/mnt/llm_registry/models/gguf
+
+Environment=PATH=/srv/abstractgpt/miniforge3/envs/abstractgpt-api/bin:/srv/abstractgpt/miniforge3/condabin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+ExecStart=/srv/abstractgpt/miniforge3/envs/abstractgpt-api/bin/uvicorn wsgi:app --host 0.0.0.0 --port 6092 --proxy-headers --forwarded-allow-ips=127.0.0.1
+
+Restart=always
+RestartSec=5
+
+RuntimeDirectory=abstractgpt-api
+RuntimeDirectoryMode=0755
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
