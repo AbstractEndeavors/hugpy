@@ -1,17 +1,10 @@
+import { useState } from 'react'
 import './ModelTable.css'
 
-function fmtCtx(n) {
-  if (n == null) return '?'
-  n = Number(n)
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${Math.round(n / 1_000)}k`
-  return String(n)
-}
-
-function StatusBadge({ installed }) {
-  return installed
-    ? <span className="badge badge-green">✓ ready</span>
-    : <span className="badge badge-red">✗ missing</span>
+function StatusBadge({ status }) {
+  if (status === 'installed') return <span className="badge badge-green">✓ ready</span>
+  if (status === 'partial')   return <span className="badge badge-yellow">◐ partial</span>
+  return <span className="badge badge-red">✗ missing</span>
 }
 
 function JobBadge({ job }) {
@@ -26,13 +19,18 @@ function JobBadge({ job }) {
   return <span className={`badge ${cls}`}>{label}</span>
 }
 
-export default function ModelTable({ models, jobsByModel, activeChat, onDownload, onChat }) {
+export default function ModelTable({ models, jobsByModel, activeChat, onDownload, onChat, onDelete }) {
+  const [openKey, setOpenKey] = useState(null)
+
   if (!models.length) {
     return <div className="empty">No models match the current filter.</div>
   }
 
+  const close = () => setOpenKey(null)
+
   return (
     <div className="table-wrap">
+      {openKey && <div className="menu-backdrop" onClick={close} />}
       <table className="model-table">
         <thead>
           <tr>
@@ -40,7 +38,6 @@ export default function ModelTable({ models, jobsByModel, activeChat, onDownload
             <th>Name</th>
             <th>Framework</th>
             <th>Task</th>
-            <th>Ctx</th>
             <th>Status</th>
             <th>Actions</th>
           </tr>
@@ -50,6 +47,9 @@ export default function ModelTable({ models, jobsByModel, activeChat, onDownload
             const job = jobsByModel[m.key]
             const isActive = m.key === activeChat
             const downloading = job && (job.status === 'queued' || job.status === 'running')
+            const installed = m.status === 'installed'
+            const onDisk = installed || m.status === 'partial'
+            const dlLabel = installed ? '↻ Re-download' : m.status === 'partial' ? '⬇ Resume download' : '⬇ Download'
             return (
               <tr key={m.key} className={isActive ? 'row-active' : ''}>
                 <td className="col-num">{i + 1}</td>
@@ -60,12 +60,11 @@ export default function ModelTable({ models, jobsByModel, activeChat, onDownload
                 <td>
                   <span className={`fw-tag fw-${m.framework}`}>{m.framework}</span>
                 </td>
-                <td className="col-task">{m.primary_task}</td>
-                <td className="col-ctx">{fmtCtx(m.model_max_length)}</td>
+                <td className="col-task">{m.task ?? m.primary_task}</td>
                 <td>
                   {downloading
                     ? <JobBadge job={job} />
-                    : <StatusBadge installed={m.installed} />
+                    : <StatusBadge status={m.status} />
                   }
                   {job?.status === 'error' && (
                     <span className="job-error" title={job.message}>!</span>
@@ -73,21 +72,34 @@ export default function ModelTable({ models, jobsByModel, activeChat, onDownload
                 </td>
                 <td className="col-actions">
                   <button
-                    className="btn-dl"
-                    onClick={() => onDownload(m.key)}
-                    disabled={downloading}
-                    title={m.installed ? 'Re-download' : 'Download'}
-                  >
-                    {m.installed ? '↻' : '⬇'}
-                  </button>
-                  <button
-                    className={`btn-chat ${isActive ? 'btn-chat-active' : ''}`}
-                    onClick={() => onChat(m.key)}
-                    disabled={!m.installed}
-                    title={m.installed ? 'Open chat' : 'Install model first'}
-                  >
-                    💬 Chat
-                  </button>
+                    className="btn-menu"
+                    onClick={() => setOpenKey(openKey === m.key ? null : m.key)}
+                    title="Actions"
+                    aria-haspopup="menu"
+                    aria-expanded={openKey === m.key}
+                  >⋯</button>
+                  {openKey === m.key && (
+                    <div className="actions-menu" role="menu">
+                      <button
+                        role="menuitem"
+                        disabled={!installed}
+                        title={installed ? 'Open chat' : 'Install model first'}
+                        onClick={() => { close(); onChat(m.key) }}
+                      >💬 Chat</button>
+                      <button
+                        role="menuitem"
+                        disabled={downloading}
+                        onClick={() => { close(); onDownload(m.key) }}
+                      >{downloading ? '… downloading' : dlLabel}</button>
+                      <button
+                        role="menuitem"
+                        className="menu-danger"
+                        disabled={!onDisk || downloading}
+                        title={onDisk ? 'Remove downloaded files from disk' : 'Nothing downloaded'}
+                        onClick={() => { close(); onDelete(m.key) }}
+                      >🗑 Delete files</button>
+                    </div>
+                  )}
                 </td>
               </tr>
             )

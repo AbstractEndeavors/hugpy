@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { fetchJson } from './api'
+import { fetchJson, normalizeJob } from './api'
 import ModelTable from './components/ModelTable'
 import ChatPanel from './components/ChatPanel'
 import AddFromHF from './components/AddFromHF'
@@ -31,8 +31,9 @@ export default function App() {
     const timer = setInterval(() => {
       active.forEach(j => {
         fetchJson(`/api/jobs/${j.job_id}`)
-          .then(updated => {
-            setJobs(prev => ({ ...prev, [updated.job_id]: updated }))
+          .then(raw => {
+            const updated = normalizeJob(raw)
+            setJobs(prev => ({ ...prev, [updated.job_id]: { ...prev[updated.job_id], ...updated } }))
             if (updated.status === 'done') refreshModels()
           })
           .catch(() => {})
@@ -44,19 +45,29 @@ export default function App() {
   // ── actions ─────────────────────────────────────────────────────────────
   const handleDownload = useCallback((modelKey) => {
     fetchJson(`/api/models/${encodeURIComponent(modelKey)}/download`, { method: 'POST' })
-      .then(data => setJobs(prev => ({
-        ...prev,
-        [data.job_id]: { job_id: data.job_id, model_key: modelKey, status: 'queued', message: '' }
-      })))
+      .then(raw => {
+        const job = normalizeJob({ ...raw, model_key: raw.model_key ?? modelKey })
+        if (job.job_id) setJobs(prev => ({ ...prev, [job.job_id]: job }))
+      })
       .catch(e => alert(`Download failed: ${e.message}`))
   }, [])
 
   const handleChat = useCallback((modelKey) => { setActiveChat(modelKey) }, [])
 
+  const handleDelete = useCallback((modelKey) => {
+    if (!window.confirm(`Delete "${modelKey}" from disk? This removes the downloaded files.`)) return
+    fetchJson(`/api/models/${encodeURIComponent(modelKey)}`, { method: 'DELETE' })
+      .then(() => {
+        setActiveChat(prev => (prev === modelKey ? null : prev))
+        refreshModels()
+      })
+      .catch(e => alert(`Delete failed: ${e.message}`))
+  }, [refreshModels])
+
   // ── derived state ────────────────────────────────────────────────────────
-  const allTasks = [...new Set(models.flatMap(m => m.tasks ?? []))]
+  const allTasks = [...new Set(models.map(m => m.task).filter(Boolean))]
   const displayed = filterTask
-    ? models.filter(m => (m.tasks ?? []).includes(filterTask))
+    ? models.filter(m => m.task === filterTask)
     : models
   const jobsByModel = {}
   Object.values(jobs).forEach(j => { jobsByModel[j.model_key] = j })
@@ -65,18 +76,9 @@ export default function App() {
   // `id` (not `job_id`). Normalize before slotting into the existing jobs map.
   // hub_id is tagged here so HFSearch can mark its row as queued.
   const handleHFJobStarted = useCallback((rawJob) => {
-    const jobId = rawJob.job_id ?? rawJob.id
-    if (!jobId) return
-    setJobs(prev => ({
-      ...prev,
-      [jobId]: {
-        job_id: jobId,
-        model_key: rawJob.model_key,
-        hub_id: rawJob.hub_id,
-        status: rawJob.status ?? 'queued',
-        message: rawJob.message ?? '',
-      },
-    }))
+    const job = normalizeJob(rawJob)
+    if (!job.job_id) return
+    setJobs(prev => ({ ...prev, [job.job_id]: job }))
     refreshModels()
   }, [refreshModels])
 
@@ -85,7 +87,7 @@ export default function App() {
   // button so users don't queue dupes.
   const pendingByHub = {}
   Object.values(jobs).forEach(j => { if (j.hub_id) pendingByHub[j.hub_id] = true })
-  models.forEach(m => { if (m.hub_id && m.installed) pendingByHub[m.hub_id] = true })
+  models.forEach(m => { if (m.hub_id && m.status === 'installed') pendingByHub[m.hub_id] = true })
 
   return (
     <div className="layout">
@@ -115,6 +117,7 @@ export default function App() {
               activeChat={activeChat}
               onDownload={handleDownload}
               onChat={handleChat}
+              onDelete={handleDelete}
             />
           )}
         </section>

@@ -172,7 +172,7 @@ export default function ChatPanel({ modelKey, model, onClose }) {
         <div className="chat-title">
           <span className="chat-model">{model?.name ?? modelKey}</span>
           <span className="chat-meta">
-            {model?.framework} · {model?.primary_task}
+            {model?.framework} · {model?.primary_task ?? model?.task}
             {system && <span className="system-set" title={system}> · sys</span>}
             {' · '}max {maxTokens} tok
             {vlCapable && <span className="vl-tag" title="vision-language model"> · 🖼 VL</span>}

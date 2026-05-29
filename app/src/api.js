@@ -22,3 +22,18 @@ export async function fetchJson(url, options) {
   }
   return data
 }
+
+// Normalize a job object from the llm_storage API into the shape the UI uses.
+// That API returns { id, status: queued|running|completed|failed, message, error };
+// the UI keys jobs by `job_id` and renders queued|running|done|error.
+const JOB_STATUS = { completed: 'done', failed: 'error' }
+
+export function normalizeJob(raw) {
+  return {
+    job_id: raw.job_id ?? raw.id,
+    model_key: raw.model_key,
+    hub_id: raw.hub_id,
+    status: JOB_STATUS[raw.status] ?? raw.status,
+    message: raw.message || raw.error || '',
+  }
+}
