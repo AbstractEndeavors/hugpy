@@ -5,14 +5,73 @@ import threading
 
 from fastapi import FastAPI, HTTPException
 
+from pydantic import BaseModel, Field
+
 from .config import settings
 from .downloader import download_model, model_status
 from .jobs import job_store
-from .manifest import load_manifest
+from .manifest import load_manifest, upsert_model, key_for_hub_id
 from .paths import model_destination
+from .peers import list_peers
 
 
 app = FastAPI(title="Local LLM Registry API")
+
+
+class HFRepoDownloadRequest(BaseModel):
+    hub_id: str = Field(..., examples=["Qwen/Qwen2.5-VL-7B-Instruct"])
+    framework: str = Field(default="transformers")
+    task: str = Field(default="text-generation")
+    filename: str | None = None
+    include: str | list[str] | None = None
+    name: str | None = None
+    register: bool = True
+
+
+@app.get("/peers")
+def peers() -> list[dict]:
+    return list_peers()
+
+
+@app.post("/repos/download")
+def download_repo(body: HFRepoDownloadRequest) -> dict:
+    model = {
+        "name": body.name or body.hub_id.split("/")[-1],
+        "hub_id": body.hub_id,
+        "framework": body.framework,
+        "task": body.task,
+        "filename": body.filename,
+        "include": body.include,
+    }
+
+    if body.register:
+        model_key, _ = upsert_model(settings.manifest_path, model)
+    else:
+        model_key = key_for_hub_id(body.hub_id)
+
+    job = job_store.create(model_key)
+
+    def runner() -> None:
+        try:
+            job_store.update(job.id, status="running", message=f"Pulling {body.hub_id}…")
+            destination = download_model(model_key, model)
+            job_store.update(
+                job.id,
+                status="completed",
+                message=f"Installed at {destination}",
+            )
+        except Exception as exc:
+            job_store.update(
+                job.id,
+                status="failed",
+                message="Download failed.",
+                error=str(exc),
+            )
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+
+    return {**job.to_dict(), "model_key": model_key}
 
 
 def get_manifest() -> dict:

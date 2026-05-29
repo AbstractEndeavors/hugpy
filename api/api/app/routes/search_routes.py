@@ -1,7 +1,7 @@
 from ..functions import *
 from ..functions.search import *
 search_bp,logger = get_bp("search_bp",__name__)
-@search_bp.get("/search", response_model=list[ModelSearchResult])
+@search_bp.route("/search", methods=["POST"])
 def search_models(
     q: str = Query(..., min_length=1),
     limit: int = Query(default=20, ge=1, le=100),

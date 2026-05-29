@@ -5,7 +5,7 @@ models_bp,logger=get_bp("models_bp",__name__)
 # Routes
 # ---------------------------------------------------------------------------
 
-@models_bp.get("/models")
+@models_bp.route("/models", methods=["GET"])
 def list_models() -> list:
     result = []
     for key, m in MODELS.items():
@@ -26,7 +26,7 @@ def list_models() -> list:
     return result
 
 
-@models_bp.get("/models/{model_key}")
+@models_bp.route("/models/{model_key}", methods=["GET"])
 def get_model(model_key: str) -> dict:
     if model_key not in MODELS:
         raise HTTPException(status_code=404, detail="Unknown model key")
@@ -39,7 +39,7 @@ def get_model(model_key: str) -> dict:
     }
 
 
-@models_bp.post("/models/{model_key}/download")
+@models_bp.route("/models/{model_key}/download", methods=["POST"])
 def start_download(model_key: str) -> dict:
     if model_key not in MODELS:
         raise HTTPException(status_code=404, detail="Unknown model key")
@@ -49,7 +49,7 @@ def start_download(model_key: str) -> dict:
     return {"job_id": job_id}
 
 
-@models_bp.get("/jobs/{job_id}")
+@models_bp.route("/jobs/{job_id}", methods=["GET"])
 def get_job(job_id: str) -> dict:
     with jobs_lock:
         job = jobs.get(job_id)
@@ -58,7 +58,7 @@ def get_job(job_id: str) -> dict:
     return job
 
 
-@models_bp.get("/jobs")
+@models_bp.route("/jobs", methods=["GET"])
 def listjobs() -> list:
     with jobs_lock:
         return list(jobs.values())
