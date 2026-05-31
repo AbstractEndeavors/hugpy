@@ -9,6 +9,27 @@ def sse_event(payload: dict) -> bytes:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+async def _proxy_worker_stream(worker: dict, prompt_kwargs: dict):
+    """Relay an assigned GPU worker's SSE inference stream.
+
+    The worker agent exposes ``POST {url}/infer/stream`` and emits the same
+    ``token`` / ``done`` / ``error`` SSE events the browser already understands,
+    so we forward its lines through unchanged. Raising before the first byte
+    lets the caller fall back to local execution.
+    """
+    import httpx
+
+    url = worker["url"].rstrip("/") + "/infer/stream"
+    timeout = httpx.Timeout(600.0, connect=10.0)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("POST", url, json=prompt_kwargs) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if line.startswith("data:"):
+                    yield (line + "\n\n").encode("utf-8")
+
+
 def chat_iter_sync(agen):
     """Drive an async generator from Flask's synchronous WSGI context."""
     loop = asyncio.new_event_loop()
@@ -66,6 +87,36 @@ async def stream_events(body: ChatBody):
         prompt_kwargs["images"] = body.images
 
     logger.info("prompt_kwargs == %s", prompt_kwargs)
+
+    # ── GPU worker offload ────────────────────────────────────────────────
+    # If an online worker is assigned to this model, hand the whole request to
+    # its GPU and relay the stream. File/image turns stay local for now (the
+    # uploaded path lives on this box, not the worker). Any failure before the
+    # worker emits a token falls through to local execution below.
+    offloadable = body.model_key and not body.file and not body.images
+    worker = None
+    if offloadable:
+        try:
+            from ..imports.utils.workers import pick_worker_for_model
+            worker = pick_worker_for_model(body.model_key)
+        except Exception:
+            worker = None
+
+    if worker:
+        produced_any = False
+        try:
+            async for chunk in _proxy_worker_stream(worker, prompt_kwargs):
+                produced_any = True
+                yield chunk
+            if produced_any:
+                return
+            logger.warning("worker %s produced no output; falling back to local", worker.get("id"))
+        except Exception as exc:
+            logger.warning("worker offload failed (%s); falling back to local", exc)
+            if produced_any:
+                # Stream already started — don't replay it locally.
+                yield sse_event({"type": "error", "message": f"worker stream interrupted: {exc}"})
+                return
 
     try:
         result = execute_prompt(**prompt_kwargs)

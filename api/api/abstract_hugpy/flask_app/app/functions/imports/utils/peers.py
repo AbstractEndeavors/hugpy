@@ -17,12 +17,7 @@ def _disk(path: str) -> dict[str, int | None]:
 
 
 def describe_self() -> dict[str, Any]:
-    """Describe this node as a peer entry.
-
-    Multi-machine peer discovery isn't wired yet — this returns the central
-    node only. When proxy/compute boxes register, append them to the list
-    served by /llm/peers.
-    """
+    """Describe this node as a peer entry — the central registry/storage box."""
     hostname = socket.gethostname()
     role = os.environ.get("LLM_PEER_ROLE", "central")
     name = os.environ.get("LLM_PEER_NAME", hostname)
@@ -39,8 +34,31 @@ def describe_self() -> dict[str, Any]:
     }
 
 
+def _worker_as_peer(worker: dict[str, Any]) -> dict[str, Any]:
+    """Project a registered GPU worker into the peer shape PeersBar renders."""
+    return {
+        "name": worker.get("name") or worker.get("id"),
+        "host": worker.get("url"),
+        "role": worker.get("role", "worker"),
+        "storage_root": worker.get("url", ""),
+        "manifest_path": "",
+        "storage_mounted": worker.get("status") == "online",
+        "disk": None,
+        "status": worker.get("status", "offline"),
+        "gpus": worker.get("gpus") or [],
+        "models": worker.get("models", []),
+        "loaded_models": worker.get("loaded_models", []),
+        "worker_id": worker.get("id"),
+    }
+
+
 def list_peers() -> list[dict[str, Any]]:
-    return [describe_self()]
+    # Central node first, then every GPU worker that has joined the pool.
+    from .workers import list_workers
+
+    peers = [describe_self()]
+    peers.extend(_worker_as_peer(w) for w in list_workers())
+    return peers
 
 def execute(**kwargs):
     """Delegated module execution. Pure **kwargs so prune_inputs passes
