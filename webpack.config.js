@@ -16,13 +16,34 @@ export default {
   },
 
   resolve: {
-    extensions: ['.js', '.jsx'],
+    extensions: ['.js', '.jsx', '.ts', '.tsx'],
+    fallback: {
+      util: false,        // stub out Node's util; the auth path doesn't need it in-browser
+    },
   },
-
+  devServer: {
+  host: '127.0.0.1',
+  port: 6091,
+  allowedHosts: ['dev.abstractgpt.ai'],   // or 'all' for dev
+  // HMR over nginx's TLS — tell the client to reach the socket via wss:443
+  client: {
+    webSocketURL: 'wss://dev.abstractgpt.ai:443/ws',
+  },
+  // proxy /api to prod
+  proxy: [
+    {
+      context: ['/api'],
+      target: 'https://abstractgpt.ai',
+      changeOrigin: true,
+      secure: true,
+    },
+  ],
+  historyApiFallback: true,   // SPA routing
+},
   module: {
     rules: [
       {
-        test: /\.(js|jsx)$/,
+        test: /\.(js|jsx|ts|tsx)$/,
         exclude: /node_modules/,
         use: {
           loader: 'babel-loader',
@@ -30,6 +51,7 @@ export default {
             presets: [
               ['@babel/preset-env', { targets: 'defaults' }],
               ['@babel/preset-react', { runtime: 'automatic' }],
+              '@babel/preset-typescript',
             ],
           },
         },
@@ -47,15 +69,4 @@ export default {
     }),
   ],
 
-  devServer: {
-    port: 5173,
-    historyApiFallback: true,
-    proxy: [
-      {
-        context: ['/api'],
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
-    ],
-  },
 }
