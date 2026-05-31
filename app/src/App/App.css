@@ -1,0 +1,46 @@
+.layout {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.logo {
+  color: var(--bright);
+  font-weight: 700;
+}
+
+.topbar-right {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.models-pane {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+}
+
+.placeholder {
+  padding: 24px;
+  color: var(--muted);
+}
+
+.placeholder.error {
+  color: var(--red);
+}
