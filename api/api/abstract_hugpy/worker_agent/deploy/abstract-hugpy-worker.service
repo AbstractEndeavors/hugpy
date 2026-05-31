@@ -16,6 +16,8 @@ EnvironmentFile=/etc/abstract-hugpy-worker.env
 # Run the agent module. Adjust the python path / venv as needed:
 #   - system python with abstract_hugpy installed:  /usr/bin/python3
 #   - a venv:  /opt/abstract_hugpy/venv/bin/python
+# This python MUST be able to `import abstract_hugpy` AND have the GPU inference
+# deps (llama-cpp-python built with CUDA, and/or torch + transformers).
 ExecStart=/usr/bin/python3 -m abstract_hugpy.worker_agent
 
 # Service account + state dir (systemd creates /var/lib/abstract-hugpy-worker).
@@ -23,20 +25,35 @@ User=hugpy
 Group=hugpy
 StateDirectory=abstract-hugpy-worker
 
+# GPU access: the service user must be in the group(s) that own the NVIDIA
+# device nodes. On most distros that's "video" (and "render" for newer ones).
+# Check with:  ls -l /dev/nvidia*    and use whatever group is shown.
+SupplementaryGroups=video render
+
 # Resilience: restart on crash, keep trying so it rejoins after a reboot or a
 # transient central/WireGuard outage.
 Restart=always
 RestartSec=5
 StartLimitIntervalSec=0
 
-# Let model loads/inference use real time; don't OOM-kill aggressively.
+# Model loads/inference can take a while; don't time out or OOM-kill eagerly.
 TimeoutStartSec=0
 KillSignal=SIGINT
 
-# Light hardening (relax if your storage paths need more access).
-NoNewPrivileges=true
-ProtectSystem=full
-ProtectHome=read-only
+# ── Optional hardening ──────────────────────────────────────────────────────
+# Left OFF by default because the common failure mode on a GPU box is the
+# sandbox blocking /dev/nvidia* or your model storage. If you want hardening,
+# uncomment these and make sure the allowances below cover your paths:
+#NoNewPrivileges=true
+#ProtectSystem=strict
+#ProtectHome=read-only
+# Writable paths the worker needs (state dir is already writable). Add your
+# model storage root (DEFAULT_ROOT) so provisioning can write models:
+#ReadWritePaths=/mnt/llm_storage /var/lib/abstract-hugpy-worker
+# Explicitly allow the GPU device nodes when using DevicePolicy:
+#DeviceAllow=/dev/nvidiactl rw
+#DeviceAllow=/dev/nvidia0 rw
+#DeviceAllow=/dev/nvidia-uvm rw
 
 [Install]
 WantedBy=multi-user.target

@@ -77,9 +77,25 @@ journalctl -u abstract-hugpy-worker -f
 `install.sh` creates a `hugpy` service user + state dir, installs the unit, and
 enables it. All configuration lives in `/etc/abstract-hugpy-worker.env` (copied
 from `deploy/abstract-hugpy-worker.env.example`); re-running the installer never
-clobbers your edited env. If you run abstract_hugpy from a venv, point
-`ExecStart` in the unit at that venv's python. To wait for WireGuard, uncomment
-the `wg-quick@wg0` lines in the unit.
+clobbers your edited env.
+
+Three things to check/adjust in the unit for your box
+(`/etc/systemd/system/abstract-hugpy-worker.service`):
+
+1. **Python** — `ExecStart` must use a python that can `import abstract_hugpy`
+   *and* has the GPU deps (CUDA `llama-cpp-python` and/or `torch`). For a venv:
+   `ExecStart=/opt/abstract_hugpy/venv/bin/python -m abstract_hugpy.worker_agent`.
+2. **GPU access** — the `hugpy` user must be in the group that owns the device
+   nodes. Run `ls -l /dev/nvidia*`; the unit's `SupplementaryGroups=video render`
+   covers the common case — edit if your distro differs.
+3. **Storage + hardening** — the `hugpy` user must read/write your model storage
+   (`DEFAULT_ROOT`). Hardening (`ProtectSystem`/`ProtectHome`) is shipped
+   **commented out** because it commonly blocks `/dev/nvidia*` or model dirs; if
+   you enable it, also set `ReadWritePaths=` to your storage root.
+
+To wait for WireGuard, uncomment the `wg-quick@wg0` lines in the unit (change
+`wg0` to your interface). Validate after editing with
+`systemd-analyze verify abstract-hugpy-worker.service`.
 
 ## Endpoints the agent serves
 
