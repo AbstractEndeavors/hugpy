@@ -88,6 +88,30 @@ def workers_get(worker_id):
     return jsonify(worker)
 
 
+@worker_bp.route("/llm/workers/<worker_id>/health", methods=["GET"])
+def workers_health(worker_id):
+    """Probe the worker's own HTTP server (not just its heartbeat).
+
+    Heartbeat liveness tells you the agent process is alive and can REACH
+    central. This instead has central call the worker's /health, which confirms
+    central -> worker connectivity (the direction chat offload actually uses)
+    and returns the worker's live GPU/loaded-model/spill snapshot.
+    """
+    worker = get_worker(worker_id)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+
+    url = (worker.get("url") or "").rstrip("/") + "/health"
+    try:
+        import httpx
+
+        resp = httpx.get(url, timeout=5.0)
+        resp.raise_for_status()
+        return jsonify({"reachable": True, "url": url, "health": resp.json()})
+    except Exception as exc:
+        return jsonify({"reachable": False, "url": url, "error": f"{type(exc).__name__}: {exc}"})
+
+
 @worker_bp.route("/llm/workers/<worker_id>/heartbeat", methods=["POST"])
 def workers_heartbeat(worker_id):
     body = HeartbeatRequest(**(request.get_json(silent=True) or {}))

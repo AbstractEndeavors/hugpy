@@ -186,17 +186,15 @@ def resolve(prompt_kwargs: Dict[str, Any]) -> Resolution:
     peer = None if force_local else peer_for(model_key, task)
 
     if peer:
+        # placement.json delegation: run this (model, task) on a remote peer.
         runner_cls = make_remote_runner(peer, framework, task)
     else:
         runner_cls = FRAMEWORK_RUNNERS.get(key)
         if runner_cls is None:
-            raise KeyError(f"No runner for {key!r}; ...")
-    runner_cls = FRAMEWORK_RUNNERS.get(key)
-    if runner_cls is None:
-        raise KeyError(
-            f"No runner for {key!r}; model={model_key!r}, "
-            f"known: {sorted(FRAMEWORK_RUNNERS)}"
-        )
+            raise KeyError(
+                f"No runner for {key!r}; model={model_key!r}, "
+                f"known: {sorted(FRAMEWORK_RUNNERS)}"
+            )
 
     logger.debug(
         "resolve: model=%s framework=%s task=%s (requested=%s primary=%s)",

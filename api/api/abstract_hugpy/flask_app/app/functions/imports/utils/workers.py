@@ -24,7 +24,13 @@ import json
 import time
 import uuid
 import threading
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
+
+try:
+    import fcntl  # POSIX advisory file locks — cross-process coordination.
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 from .schemas import settings
 
@@ -53,38 +59,95 @@ def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class WorkerStore:
-    """Thread-safe, file-backed registry of GPU workers."""
+    """Disk-authoritative, multi-process-safe registry of GPU workers.
+
+    Under gunicorn/uwsgi the API runs as several processes, so an in-memory
+    dict would split-brain: a worker registered in process A would be invisible
+    to a heartbeat or chat request handled by process B (the classic symptom is
+    "registers + shows in the UI, but heartbeats 410 and chats never offload").
+
+    To avoid that, ``workers.json`` is the single source of truth: every read
+    re-loads it, and every mutation takes an exclusive ``fcntl`` lock, reloads,
+    mutates, and writes back atomically. A short-lived in-process RLock just
+    keeps threads within one process from racing the same fd.
+    """
 
     def __init__(self, path: Optional[str] = None) -> None:
         self._path = path or _default_workers_path()
         self._lock = threading.RLock()
-        self._workers: Dict[str, Dict[str, Any]] = {}
-        self._load()
+        self._ensure_parent()
 
-    # -- persistence --------------------------------------------------------
-    def _load(self) -> None:
-        try:
-            if os.path.exists(self._path):
-                with open(self._path, "r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-                if isinstance(data, dict):
-                    self._workers = {w["id"]: w for w in data.get("workers", []) if w.get("id")}
-        except (OSError, ValueError, KeyError):
-            # A corrupt registry should never take the API down; start empty.
-            self._workers = {}
-
-    def _save(self) -> None:
-        try:
-            parent = os.path.dirname(self._path)
-            if parent:
+    # -- persistence (disk-authoritative) ----------------------------------
+    def _ensure_parent(self) -> None:
+        parent = os.path.dirname(self._path)
+        if parent:
+            try:
                 os.makedirs(parent, exist_ok=True)
-            tmp = f"{self._path}.tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"workers": list(self._workers.values())}, fh, indent=2)
-            os.replace(tmp, self._path)
+            except OSError:
+                pass
+
+    def _read_unlocked(self, fh=None) -> Dict[str, Dict[str, Any]]:
+        """Parse the workers map from an open fh, or from disk if none given."""
+        try:
+            if fh is not None:
+                fh.seek(0)
+                raw = fh.read()
+            elif os.path.exists(self._path):
+                with open(self._path, "r", encoding="utf-8") as f:
+                    raw = f.read()
+            else:
+                return {}
+            if not raw.strip():
+                return {}
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return {w["id"]: w for w in data.get("workers", []) if w.get("id")}
+        except (OSError, ValueError, KeyError):
+            return {}
+        return {}
+
+    def _write_unlocked(self, fh, workers: Dict[str, Dict[str, Any]]) -> None:
+        """Overwrite the open, locked fh with the workers map."""
+        payload = json.dumps({"workers": list(workers.values())}, indent=2)
+        fh.seek(0)
+        fh.truncate()
+        fh.write(payload)
+        fh.flush()
+        try:
+            os.fsync(fh.fileno())
         except OSError:
-            # Persistence is best-effort; the in-memory pool keeps working.
             pass
+
+    def _load(self) -> Dict[str, Dict[str, Any]]:
+        """Read-only snapshot of the current registry from disk."""
+        with self._lock:
+            return self._read_unlocked()
+
+    @contextmanager
+    def _transaction(self):
+        """Yield the on-disk workers map under an exclusive cross-process lock.
+
+        Reload -> mutate (caller) -> persist. The yielded dict is written back
+        when the block exits without raising. Falls back to a plain in-process
+        critical section when ``fcntl`` is unavailable.
+        """
+        with self._lock:
+            self._ensure_parent()
+            # Open r+ (create if missing) so we hold one fd for lock+read+write.
+            fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
+            fh = os.fdopen(fd, "r+", encoding="utf-8")
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                workers = self._read_unlocked(fh)
+                yield workers
+                self._write_unlocked(fh, workers)
+            finally:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                finally:
+                    fh.close()
 
     # -- registration / lifecycle ------------------------------------------
     def register(
@@ -104,12 +167,12 @@ class WorkerStore:
         its assignments instead of creating a duplicate row.
         """
         url = (url or "").rstrip("/")
-        with self._lock:
+        with self._transaction() as workers:
             existing = None
-            if worker_id and worker_id in self._workers:
-                existing = self._workers[worker_id]
+            if worker_id and worker_id in workers:
+                existing = workers[worker_id]
             else:
-                for w in self._workers.values():
+                for w in workers.values():
                     if w.get("url") == url:
                         existing = w
                         break
@@ -124,7 +187,6 @@ class WorkerStore:
                 )
                 if models is not None:
                     existing["models"] = sorted(set(models))
-                self._save()
                 return _public_view(existing)
 
             wid = worker_id or uuid.uuid4().hex
@@ -138,8 +200,7 @@ class WorkerStore:
                 "created_at": _now(),
                 "last_seen": _now(),
             }
-            self._workers[wid] = worker
-            self._save()
+            workers[wid] = worker
             return _public_view(worker)
 
     def heartbeat(
@@ -151,8 +212,8 @@ class WorkerStore:
         spill: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a worker alive and refresh its live GPU / loaded-model stats."""
-        with self._lock:
-            worker = self._workers.get(worker_id)
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
             if worker is None:
                 return None
             worker["last_seen"] = _now()
@@ -162,15 +223,11 @@ class WorkerStore:
                 worker["loaded_models"] = loaded_models
             if spill is not None:
                 worker["spill"] = spill
-            self._save()
             return _public_view(worker)
 
     def remove(self, worker_id: str) -> bool:
-        with self._lock:
-            existed = self._workers.pop(worker_id, None) is not None
-            if existed:
-                self._save()
-            return existed
+        with self._transaction() as workers:
+            return workers.pop(worker_id, None) is not None
 
     # -- model assignment ---------------------------------------------------
     def assign_model(
@@ -185,8 +242,8 @@ class WorkerStore:
         gpu_mem_gib, cpu_mem_gib) the worker applies when it loads the model.
         Omitted / None means "use the worker's autofit default."
         """
-        with self._lock:
-            worker = self._workers.get(worker_id)
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
             if worker is None:
                 return None
             models = set(worker.get("models", []))
@@ -199,36 +256,31 @@ class WorkerStore:
                     by_model[model_key] = spill
                 else:
                     by_model.pop(model_key, None)
-            self._save()
             return _public_view(worker)
 
     def unassign_model(self, worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            worker = self._workers.get(worker_id)
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
             if worker is None:
                 return None
             worker["models"] = sorted(set(worker.get("models", [])) - {model_key})
             worker.get("spill_by_model", {}).pop(model_key, None)
-            self._save()
             return _public_view(worker)
 
     def spill_for(self, worker_id: str, model_key: str) -> Dict[str, Any]:
         """Per-assignment spill override for (worker, model), or {} for autofit."""
-        with self._lock:
-            worker = self._workers.get(worker_id)
-            if worker is None:
-                return {}
-            return dict(worker.get("spill_by_model", {}).get(model_key, {}))
+        worker = self._load().get(worker_id)
+        if worker is None:
+            return {}
+        return dict(worker.get("spill_by_model", {}).get(model_key, {}))
 
     # -- queries ------------------------------------------------------------
     def get(self, worker_id: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            worker = self._workers.get(worker_id)
-            return _public_view(worker) if worker else None
+        worker = self._load().get(worker_id)
+        return _public_view(worker) if worker else None
 
     def all(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            return [_public_view(w) for w in self._workers.values()]
+        return [_public_view(w) for w in self._load().values()]
 
     def workers_for_model(self, model_key: str, *, online_only: bool = True) -> List[Dict[str, Any]]:
         out = []
@@ -260,11 +312,13 @@ class WorkerStore:
         pool.sort(key=lambda w: w.get("last_picked", 0))
         chosen = pool[0]
 
-        with self._lock:
-            stored = self._workers.get(chosen["id"])
+        # Persist the pick so round-robin survives across processes.
+        with self._transaction() as workers:
+            stored = workers.get(chosen["id"])
             if stored is not None:
                 stored["last_picked"] = _now()
-        return chosen
+                chosen = stored
+        return _public_view(chosen)
 
 
 worker_store = WorkerStore()

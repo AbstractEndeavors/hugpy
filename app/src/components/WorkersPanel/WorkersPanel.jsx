@@ -45,6 +45,17 @@ function WorkerRow({ worker, models, onAssign, onUnassign, onRemove }) {
   const [pick, setPick] = useState('')
   const [adv, setAdv]   = useState(false)
   const [spill, setSpill] = useState({ n_gpu_layers: '', gpu_mem_gib: '', cpu_mem_gib: '' })
+  const [ping, setPing] = useState(null)   // null | 'checking' | {reachable, error}
+
+  const checkHealth = useCallback(async () => {
+    setPing('checking')
+    try {
+      const r = await fetchJson(`/api/llm/workers/${encodeURIComponent(worker.id)}/health`)
+      setPing(r)
+    } catch (e) {
+      setPing({ reachable: false, error: e.message })
+    }
+  }, [worker.id])
 
   const assignable = useMemo(() => {
     const assigned = new Set(worker.models || [])
@@ -74,6 +85,16 @@ function WorkerRow({ worker, models, onAssign, onUnassign, onRemove }) {
         <span className="wp-status">{worker.status}</span>
         <span className="wp-url" title={worker.url}>{worker.url}</span>
         <SpillBadge spill={worker.spill} />
+        {ping && ping !== 'checking' && (
+          <span className={`wp-ping ${ping.reachable ? 'wp-ping-ok' : 'wp-ping-bad'}`}
+                title={ping.reachable ? 'central can reach this worker' : (ping.error || 'unreachable')}>
+            {ping.reachable ? '✓ reachable' : '✗ unreachable'}
+          </span>
+        )}
+        <button className="wp-ping-btn" title="Ping the worker's /health from central"
+                onClick={checkHealth} disabled={ping === 'checking'}>
+          {ping === 'checking' ? '…' : 'ping'}
+        </button>
         <button className="wp-remove" title="Remove worker" onClick={() => onRemove(worker)}>✕</button>
       </div>
 

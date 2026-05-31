@@ -166,3 +166,21 @@
   color: #6e7681;
   flex: 1 1 100%;
 }
+
+.wp-ping-btn {
+  padding: 4px 8px;
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  color: #8b949e;
+  cursor: pointer;
+  font-size: 11px;
+}
+.wp-ping-btn:hover { background: #2d333b; color: #c9d1d9; }
+.wp-ping {
+  font-size: 11px;
+  border-radius: 10px;
+  padding: 1px 8px;
+}
+.wp-ping-ok  { color: #3fb950; background: #102a16; border: 1px solid #1c5a2c; }
+.wp-ping-bad { color: #f85149; background: #2d1113; border: 1px solid #6e2b2b; }
