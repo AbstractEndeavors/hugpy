@@ -26,10 +26,25 @@ function GpuChips({ gpus }) {
   )
 }
 
-// A worker row: shows status + GPUs, the models it serves, and controls to
-// attach the worker's compute to any model from the llmTable.
+function SpillBadge({ spill }) {
+  if (!spill || !spill.mode) return null
+  const free = spill.free_vram_bytes
+  const label = spill.mode === 'auto' ? 'autofit' : spill.mode
+  return (
+    <span className="wp-spill" title="GPU/CPU split mode reported by the worker">
+      spill: {label}
+      {free != null && <em> · {fmtBytes(free)} VRAM free</em>}
+    </span>
+  )
+}
+
+// A worker row: shows status + GPUs + spill mode, the models it serves, and
+// controls to attach the worker's compute to any model from the llmTable —
+// with an optional advanced GPU/CPU split override per assignment.
 function WorkerRow({ worker, models, onAssign, onUnassign, onRemove }) {
   const [pick, setPick] = useState('')
+  const [adv, setAdv]   = useState(false)
+  const [spill, setSpill] = useState({ n_gpu_layers: '', gpu_mem_gib: '', cpu_mem_gib: '' })
 
   const assignable = useMemo(() => {
     const assigned = new Set(worker.models || [])
@@ -41,6 +56,16 @@ function WorkerRow({ worker, models, onAssign, onUnassign, onRemove }) {
     [models],
   )
 
+  // Build the spill override dict from the advanced inputs (empty = autofit).
+  const buildSpill = useCallback(() => {
+    if (!adv) return null
+    const out = {}
+    if (spill.n_gpu_layers !== '') out.n_gpu_layers = spill.n_gpu_layers
+    if (spill.gpu_mem_gib !== '')  out.gpu_mem_gib = Number(spill.gpu_mem_gib)
+    if (spill.cpu_mem_gib !== '')  out.cpu_mem_gib = Number(spill.cpu_mem_gib)
+    return Object.keys(out).length ? out : null
+  }, [adv, spill])
+
   return (
     <div className={`wp-worker wp-${worker.status}`}>
       <div className="wp-worker-head">
@@ -48,6 +73,7 @@ function WorkerRow({ worker, models, onAssign, onUnassign, onRemove }) {
         <span className="wp-name">{worker.name}</span>
         <span className="wp-status">{worker.status}</span>
         <span className="wp-url" title={worker.url}>{worker.url}</span>
+        <SpillBadge spill={worker.spill} />
         <button className="wp-remove" title="Remove worker" onClick={() => onRemove(worker)}>✕</button>
       </div>
 
@@ -58,9 +84,13 @@ function WorkerRow({ worker, models, onAssign, onUnassign, onRemove }) {
         {(worker.models || []).length === 0 && <span className="wp-none">— nothing assigned —</span>}
         {(worker.models || []).map(key => {
           const warm = (worker.loaded_models || []).includes(key)
+          const override = worker.spill_by_model?.[key]
+          const title = override
+            ? `manual split: ${JSON.stringify(override)}`
+            : (warm ? 'loaded on GPU (autofit)' : 'assigned (autofit)')
           return (
-            <span key={key} className={`wp-model ${warm ? 'wp-warm' : ''}`} title={warm ? 'loaded on GPU' : 'assigned'}>
-              {warm ? '🔥 ' : ''}{nameFor(key)}
+            <span key={key} className={`wp-model ${warm ? 'wp-warm' : ''}`} title={title}>
+              {warm ? '🔥 ' : ''}{nameFor(key)}{override ? ' ⚙' : ''}
               <button className="wp-model-x" title="Unassign" onClick={() => onUnassign(worker, key)}>×</button>
             </span>
           )
@@ -75,11 +105,36 @@ function WorkerRow({ worker, models, onAssign, onUnassign, onRemove }) {
         <button
           className="wp-assign"
           disabled={!pick}
-          onClick={() => { onAssign(worker, pick); setPick('') }}
+          onClick={() => { onAssign(worker, pick, buildSpill()); setPick('') }}
         >
           + Assign GPU
         </button>
+        <button className="wp-adv-toggle" onClick={() => setAdv(a => !a)}
+                title="Manual GPU/CPU split (default is autofit)">
+          {adv ? '▾ split' : '▸ split'}
+        </button>
       </div>
+
+      {adv && (
+        <div className="wp-spill-form">
+          <label title="llama.cpp: layers on GPU. Blank/auto = fit automatically; 0 = CPU only.">
+            GPU layers
+            <input type="number" placeholder="auto" value={spill.n_gpu_layers}
+                   onChange={e => setSpill(s => ({ ...s, n_gpu_layers: e.target.value }))} />
+          </label>
+          <label title="transformers: per-GPU VRAM budget (GiB)">
+            GPU GiB
+            <input type="number" step="0.5" placeholder="auto" value={spill.gpu_mem_gib}
+                   onChange={e => setSpill(s => ({ ...s, gpu_mem_gib: e.target.value }))} />
+          </label>
+          <label title="transformers: CPU/RAM budget for spilled layers (GiB)">
+            CPU GiB
+            <input type="number" step="1" placeholder="auto" value={spill.cpu_mem_gib}
+                   onChange={e => setSpill(s => ({ ...s, cpu_mem_gib: e.target.value }))} />
+          </label>
+          <span className="wp-spill-hint">Blank = autofit. Applies on next load of the assigned model.</span>
+        </div>
+      )}
     </div>
   )
 }
@@ -126,12 +181,14 @@ export default function WorkersPanel({ models = [] }) {
     }
   }, [form, load])
 
-  const assign = useCallback(async (worker, modelKey) => {
+  const assign = useCallback(async (worker, modelKey, spill) => {
     try {
+      const body = { model_key: modelKey }
+      if (spill) body.spill = spill
       await fetchJson(`/api/llm/workers/${encodeURIComponent(worker.id)}/assign`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model_key: modelKey }),
+        body: JSON.stringify(body),
       })
       load()
     } catch (err) { alert(`Assign failed: ${err.message}`) }

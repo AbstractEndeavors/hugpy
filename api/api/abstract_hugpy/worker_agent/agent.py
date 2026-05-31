@@ -162,6 +162,19 @@ class CentralClient:
 # ---------------------------------------------------------------------------
 # Local inference (reuses the same dispatch the central node uses)
 # ---------------------------------------------------------------------------
+def _ensure_present(payload: dict, central_url: str | None) -> None:
+    """Provision the requested model before inference (central-first, HF fallback)."""
+    model_key = payload.get("model_key")
+    if not model_key:
+        return
+    try:
+        from .provision import ensure_model_present
+
+        ensure_model_present(model_key, central_url)
+    except Exception as exc:
+        logger.warning("provisioning check for %s failed: %s", model_key, exc)
+
+
 def _run_once(payload: dict) -> dict:
     from abstract_hugpy.managers.dispatch import execute_prompt
 
@@ -176,6 +189,37 @@ def _run_once(payload: dict) -> dict:
             "finish_reason": getattr(result, "finish_reason", None) or "stop",
         }
     return {"ok": False, "error": getattr(result, "error", None) or "run failed"}
+
+
+_SPILL_ENV = {
+    "n_gpu_layers": "HUGPY_N_GPU_LAYERS",
+    "gpu_mem_gib": "HUGPY_GPU_MEM_GIB",
+    "cpu_mem_gib": "HUGPY_CPU_MEM_GIB",
+    "tensor_split": "HUGPY_TENSOR_SPLIT",
+    "main_gpu": "HUGPY_MAIN_GPU",
+    "n_gpu": "HUGPY_N_GPU",
+}
+
+
+def _apply_spill(spill: dict | None) -> None:
+    """Translate a per-request spill override dict into the env vars the spill
+    module reads. Only set keys that were provided; the model loads lazily, so
+    setting these before the first request for a model takes effect on load.
+
+    NOTE: changing spill for an ALREADY-loaded model has no effect until it's
+    evicted/reloaded — central can force that via a fresh worker process or by
+    reassigning before first use. For the common case (assign, then chat) the
+    override lands before the model is built.
+    """
+    if not spill:
+        return
+    for key, env_name in _SPILL_ENV.items():
+        if key not in spill or spill[key] is None:
+            continue
+        val = spill[key]
+        if isinstance(val, (list, tuple)):
+            val = ",".join(str(x) for x in val)
+        os.environ[env_name] = str(val)
 
 
 def _sse(payload: dict) -> str:
@@ -228,6 +272,15 @@ def loaded_model_keys() -> list[str]:
         return []
 
 
+def _spill_describe() -> dict:
+    try:
+        from abstract_hugpy.managers.spill import describe
+
+        return describe()
+    except Exception:
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
@@ -243,17 +296,22 @@ def build_app(state: "WorkerState") -> Flask:
                 "name": state.name,
                 "gpus": detect_gpus(),
                 "loaded_models": loaded_model_keys(),
+                "spill": _spill_describe(),
             }
         )
 
     @app.route("/infer", methods=["POST"])
     def infer():
         payload = request.get_json(silent=True) or {}
+        _apply_spill(payload.pop("spill", None))
+        _ensure_present(payload, state.central_url)
         return jsonify(_run_once(payload))
 
     @app.route("/infer/stream", methods=["POST"])
     def infer_stream():
         payload = request.get_json(silent=True) or {}
+        _apply_spill(payload.pop("spill", None))
+        _ensure_present(payload, state.central_url)
         return Response(
             stream_with_context(_stream_sync(payload)),
             mimetype="text/event-stream",
@@ -272,10 +330,12 @@ def build_app(state: "WorkerState") -> Flask:
 # Agent lifecycle
 # ---------------------------------------------------------------------------
 class WorkerState:
-    def __init__(self, name: str, url: str, worker_id: str | None):
+    def __init__(self, name: str, url: str, worker_id: str | None,
+                 central_url: str | None = None):
         self.name = name
         self.url = url
         self.worker_id = worker_id
+        self.central_url = central_url
 
 
 def _load_worker_id(path: str) -> str | None:
@@ -301,7 +361,11 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
         try:
             client.heartbeat(
                 state.worker_id,
-                {"gpus": detect_gpus(), "loaded_models": loaded_model_keys()},
+                {
+                    "gpus": detect_gpus(),
+                    "loaded_models": loaded_model_keys(),
+                    "spill": _spill_describe(),
+                },
             )
         except urllib.error.HTTPError as exc:
             if exc.code == 410:
@@ -347,7 +411,50 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--heartbeat", type=float, default=float(os.environ.get("WORKER_HEARTBEAT", "15")))
     p.add_argument("--id-file", default=os.environ.get(
         "WORKER_ID_FILE", os.path.expanduser("~/.abstract_hugpy_worker.json")))
+
+    # GPU/CPU spill defaults for this worker. These seed the spill env the
+    # inference path reads; per-request overrides from central still win.
+    spill = p.add_argument_group("spill (GPU/CPU split)")
+    spill.add_argument("--spill", choices=["auto", "off"],
+                       default=os.environ.get("WORKER_SPILL", "auto"),
+                       help="auto = fit as many layers on GPU as VRAM allows "
+                            "(spill rest to CPU); off = CPU only")
+    spill.add_argument("--n-gpu-layers", type=int, default=_safe_int(os.environ.get("WORKER_N_GPU_LAYERS")),
+                       help="llama.cpp: force N layers on GPU (overrides --spill)")
+    spill.add_argument("--gpu-mem", type=float, default=_safe_float(os.environ.get("WORKER_GPU_MEM_GIB")),
+                       help="transformers: per-GPU memory budget in GiB")
+    spill.add_argument("--cpu-mem", type=float, default=_safe_float(os.environ.get("WORKER_CPU_MEM_GIB")),
+                       help="transformers: CPU/RAM budget in GiB for offloaded layers")
+    spill.add_argument("--tensor-split", default=os.environ.get("WORKER_TENSOR_SPLIT"),
+                       help="multi-GPU split, comma-separated e.g. 0.7,0.3")
+    spill.add_argument("--main-gpu", type=int, default=_safe_int(os.environ.get("WORKER_MAIN_GPU")),
+                       help="primary GPU index")
     return p
+
+
+def _safe_float(value) -> float | None:
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_cli_spill(args) -> None:
+    """Seed the spill env from CLI flags (per-request overrides still win)."""
+    if args.n_gpu_layers is not None:
+        os.environ["HUGPY_N_GPU_LAYERS"] = str(args.n_gpu_layers)
+    elif args.spill == "off":
+        os.environ["HUGPY_N_GPU_LAYERS"] = "off"
+    else:
+        os.environ.setdefault("HUGPY_N_GPU_LAYERS", "auto")
+    if args.gpu_mem is not None:
+        os.environ["HUGPY_GPU_MEM_GIB"] = str(args.gpu_mem)
+    if args.cpu_mem is not None:
+        os.environ["HUGPY_CPU_MEM_GIB"] = str(args.cpu_mem)
+    if args.tensor_split:
+        os.environ["HUGPY_TENSOR_SPLIT"] = args.tensor_split
+    if args.main_gpu is not None:
+        os.environ["HUGPY_MAIN_GPU"] = str(args.main_gpu)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -358,12 +465,16 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --central (or WORKER_CENTRAL_URL) is required", file=sys.stderr)
         return 2
 
+    _apply_cli_spill(args)
+
     advertise = args.advertise
     if not advertise:
         host = args.host if args.host not in ("0.0.0.0", "::") else socket.gethostbyname(socket.gethostname())
         advertise = f"http://{host}:{args.port}"
 
-    state = WorkerState(name=args.name, url=advertise, worker_id=_load_worker_id(args.id_file))
+    state = WorkerState(name=args.name, url=advertise,
+                        worker_id=_load_worker_id(args.id_file),
+                        central_url=args.central)
     client = CentralClient(args.central)
 
     try:

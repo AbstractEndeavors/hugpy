@@ -9,16 +9,22 @@ These endpoints serve two audiences:
         GET    /llm/workers
         GET    /llm/workers/<id>
         DELETE /llm/workers/<id>
-        POST   /llm/workers/<id>/assign      {"model_key": ...}
+        POST   /llm/workers/<id>/assign      {"model_key": ..., "spill": {...}?}
         POST   /llm/workers/<id>/unassign    {"model_key": ...}
+  * model provisioning (worker pulls files from central over WireGuard):
+        GET    /llm/models/<model_key>/manifest      file list + sizes + meta
+        GET    /llm/models/<model_key>/file?path=..  stream one file (Range ok)
 
 All registry state lives in functions.imports.utils.workers; this module only
-translates HTTP <-> that store. get_bp, the worker_store helpers and
-get_models_dict are all re-exported through functions/__init__ (imports → utils),
-mirroring how llm_storage_routes.py pulls its registry helpers.
+translates HTTP <-> that store. get_bp, the worker_store helpers,
+get_models_dict, get_model_config and route_destination are all re-exported
+through functions/__init__ (imports → utils), mirroring how
+llm_storage_routes.py pulls its registry helpers.
 """
+import os
+
 from pydantic import BaseModel, Field
-from flask import request, jsonify, abort
+from flask import request, jsonify, abort, send_file
 
 from ..functions import *
 
@@ -44,10 +50,15 @@ class RegisterRequest(BaseModel):
 class HeartbeatRequest(BaseModel):
     gpus: list[GpuInfo] | None = None
     loaded_models: list[str] | None = None
+    spill: dict | None = None
 
 
 class AssignRequest(BaseModel):
     model_key: str
+    # Optional per-assignment GPU/CPU spill override. Empty/omitted = autofit.
+    # Recognized keys: n_gpu_layers (int|"auto"|"off"), gpu_mem_gib (float),
+    # cpu_mem_gib (float), tensor_split (list[float]).
+    spill: dict | None = None
 
 
 @worker_bp.route("/llm/workers", methods=["GET"])
@@ -84,6 +95,7 @@ def workers_heartbeat(worker_id):
         worker_id,
         gpus=[g.model_dump() for g in body.gpus] if body.gpus is not None else None,
         loaded_models=body.loaded_models,
+        spill=body.spill,
     )
     if worker is None:
         # The agent thinks it's registered but central forgot it (restart,
@@ -104,7 +116,7 @@ def workers_assign(worker_id):
     body = AssignRequest(**(request.get_json(silent=True) or {}))
     if body.model_key not in get_models_dict(dict_return=True):
         abort(404, description="Unknown model key.")
-    worker = assign_model(worker_id, body.model_key)
+    worker = assign_model(worker_id, body.model_key, spill=body.spill)
     if worker is None:
         abort(404, description="Unknown worker id.")
     return jsonify(worker)
@@ -117,3 +129,75 @@ def workers_unassign(worker_id):
     if worker is None:
         abort(404, description="Unknown worker id.")
     return jsonify(worker)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Model provisioning — workers pull missing model files from central.
+#
+# A worker that lacks a model calls /manifest to learn the file list + the
+# routing metadata (framework/task/hub_id) it needs to place the files under
+# its OWN storage root, then GETs each file via /file. Streaming with send_file
+# means large GGUF/safetensors transfers don't buffer in memory and support
+# HTTP Range (resumable). Both routes are read-only and confined to the model's
+# own destination directory.
+# ──────────────────────────────────────────────────────────────────────────
+def _model_dir_or_404(model_key: str):
+    manifest = get_models_dict(dict_return=True)
+    if model_key not in manifest:
+        abort(404, description="Unknown model key.")
+    model = manifest[model_key]
+    dest = route_destination(model)
+    if not os.path.isdir(dest):
+        abort(409, description="Model is not installed on central.")
+    return model, os.path.realpath(dest)
+
+
+@worker_bp.route("/llm/models/<model_key>/manifest", methods=["GET"])
+def model_file_manifest(model_key):
+    model, dest = _model_dir_or_404(model_key)
+
+    files = []
+    total = 0
+    for root, _dirs, names in os.walk(dest):
+        for name in names:
+            full = os.path.join(root, name)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            rel = os.path.relpath(full, dest)
+            files.append({"path": rel, "size": size})
+            total += size
+
+    return jsonify({
+        "model_key": model_key,
+        "hub_id": model.get("hub_id"),
+        "name": model.get("name"),
+        "framework": model.get("framework"),
+        "task": model.get("task") or model.get("primary_task"),
+        "filename": model.get("filename"),
+        "include": model.get("include"),
+        "total_bytes": total,
+        "files": files,
+    })
+
+
+@worker_bp.route("/llm/models/<model_key>/file", methods=["GET"])
+def model_file(model_key):
+    _model, dest = _model_dir_or_404(model_key)
+
+    rel = request.args.get("path", "")
+    if not rel:
+        abort(400, description="Missing ?path=")
+
+    # Resolve and confine: the final real path must stay inside dest.
+    target = os.path.realpath(os.path.join(dest, rel))
+    if target != dest and not target.startswith(dest + os.sep):
+        abort(403, description="Path escapes model directory.")
+    if not os.path.isfile(target):
+        abort(404, description="No such file.")
+
+    # conditional/Range handling is provided by send_file.
+    return send_file(target, as_attachment=True,
+                     download_name=os.path.basename(target),
+                     conditional=True)

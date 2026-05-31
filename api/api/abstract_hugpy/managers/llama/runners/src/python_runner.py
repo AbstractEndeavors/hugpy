@@ -12,8 +12,10 @@ class LlamaCppPythonRunner(LlamaCppBaseRunner):
         *,
         n_ctx: int = DEFAULT_N_CTX,
         n_threads: Optional[int] = None,
+        n_gpu_layers: Optional[int] = None,
     ):
         from llama_cpp import Llama
+        from ....spill import llama_kwargs
 
         self.model_key = model_key
         self.cfg = get_model_config(model_key)
@@ -30,16 +32,27 @@ class LlamaCppPythonRunner(LlamaCppBaseRunner):
         self.n_threads = n_threads or max(1, (os.cpu_count() or 4) - 1)
         self.generate_lock = threading.Lock()
 
+        # GPU/CPU spill. The resolver/dispatch path doesn't pass n_gpu_layers,
+        # so by default we derive it from the spill module (env + autofit).
+        # An explicit constructor arg always wins. Without this, llama.cpp ran
+        # CPU-only because n_gpu_layers was never set.
+        gpu_kwargs = llama_kwargs(self.model_path)
+        if n_gpu_layers is not None:
+            gpu_kwargs["n_gpu_layers"] = n_gpu_layers
+        self.n_gpu_layers = gpu_kwargs.get("n_gpu_layers", 0)
+
         self.llm = Llama(
             model_path=self.model_path,
             n_ctx=self.n_ctx,
             n_threads=self.n_threads,
             verbose=False,
+            **gpu_kwargs,
         )
 
         logger.info(
-            "LlamaCppPythonRunner ready: model=%s n_ctx=%s n_threads=%s path=%s",
-            model_key, self.n_ctx, self.n_threads, self.model_path,
+            "LlamaCppPythonRunner ready: model=%s n_ctx=%s n_threads=%s "
+            "n_gpu_layers=%s path=%s",
+            model_key, self.n_ctx, self.n_threads, self.n_gpu_layers, self.model_path,
         )
 
     async def _iter_stream(self, messages, max_tokens, temp, top_p):

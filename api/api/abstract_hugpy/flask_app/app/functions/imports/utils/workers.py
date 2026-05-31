@@ -148,6 +148,7 @@ class WorkerStore:
         *,
         gpus: Optional[List[Dict[str, Any]]] = None,
         loaded_models: Optional[List[str]] = None,
+        spill: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a worker alive and refresh its live GPU / loaded-model stats."""
         with self._lock:
@@ -159,6 +160,8 @@ class WorkerStore:
                 worker["gpus"] = gpus
             if loaded_models is not None:
                 worker["loaded_models"] = loaded_models
+            if spill is not None:
+                worker["spill"] = spill
             self._save()
             return _public_view(worker)
 
@@ -170,7 +173,18 @@ class WorkerStore:
             return existed
 
     # -- model assignment ---------------------------------------------------
-    def assign_model(self, worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
+    def assign_model(
+        self,
+        worker_id: str,
+        model_key: str,
+        spill: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Assign a model to a worker, with optional per-assignment spill config.
+
+        ``spill`` is an opaque dict of GPU/CPU knobs (e.g. n_gpu_layers,
+        gpu_mem_gib, cpu_mem_gib) the worker applies when it loads the model.
+        Omitted / None means "use the worker's autofit default."
+        """
         with self._lock:
             worker = self._workers.get(worker_id)
             if worker is None:
@@ -178,6 +192,13 @@ class WorkerStore:
             models = set(worker.get("models", []))
             models.add(model_key)
             worker["models"] = sorted(models)
+            if spill is not None:
+                by_model = worker.setdefault("spill_by_model", {})
+                # An empty dict clears any override back to autofit.
+                if spill:
+                    by_model[model_key] = spill
+                else:
+                    by_model.pop(model_key, None)
             self._save()
             return _public_view(worker)
 
@@ -187,8 +208,17 @@ class WorkerStore:
             if worker is None:
                 return None
             worker["models"] = sorted(set(worker.get("models", [])) - {model_key})
+            worker.get("spill_by_model", {}).pop(model_key, None)
             self._save()
             return _public_view(worker)
+
+    def spill_for(self, worker_id: str, model_key: str) -> Dict[str, Any]:
+        """Per-assignment spill override for (worker, model), or {} for autofit."""
+        with self._lock:
+            worker = self._workers.get(worker_id)
+            if worker is None:
+                return {}
+            return dict(worker.get("spill_by_model", {}).get(model_key, {}))
 
     # -- queries ------------------------------------------------------------
     def get(self, worker_id: str) -> Optional[Dict[str, Any]]:
@@ -247,6 +277,7 @@ def register_worker(**kwargs) -> Dict[str, Any]:
 
 
 def heartbeat_worker(worker_id: str, **kwargs) -> Optional[Dict[str, Any]]:
+    # kwargs: gpus, loaded_models, spill — all optional, passed straight through.
     return worker_store.heartbeat(worker_id, **kwargs)
 
 
@@ -254,12 +285,17 @@ def remove_worker(worker_id: str) -> bool:
     return worker_store.remove(worker_id)
 
 
-def assign_model(worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
-    return worker_store.assign_model(worker_id, model_key)
+def assign_model(worker_id: str, model_key: str,
+                 spill: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    return worker_store.assign_model(worker_id, model_key, spill=spill)
 
 
 def unassign_model(worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
     return worker_store.unassign_model(worker_id, model_key)
+
+
+def spill_for(worker_id: str, model_key: str) -> Dict[str, Any]:
+    return worker_store.spill_for(worker_id, model_key)
 
 
 def list_workers() -> List[Dict[str, Any]]:

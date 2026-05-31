@@ -103,9 +103,20 @@ async def stream_events(body: ChatBody):
             worker = None
 
     if worker:
+        # Attach this worker's per-assignment spill override (if any) so the
+        # worker loads the model with the operator's chosen GPU/CPU split.
+        worker_kwargs = dict(prompt_kwargs)
+        try:
+            from ..imports.utils.workers import spill_for
+            spill = spill_for(worker.get("id"), body.model_key)
+            if spill:
+                worker_kwargs["spill"] = spill
+        except Exception:
+            pass
+
         produced_any = False
         try:
-            async for chunk in _proxy_worker_stream(worker, prompt_kwargs):
+            async for chunk in _proxy_worker_stream(worker, worker_kwargs):
                 produced_any = True
                 yield chunk
             if produced_any:

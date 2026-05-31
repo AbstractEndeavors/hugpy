@@ -96,6 +96,15 @@ class DeepCoder:
 
         if self.cfg.device == "cuda":
             kwargs["device_map"] = "auto"
+            # GPU/CPU spill: a max_memory budget lets accelerate shard layers to
+            # fit VRAM and offload the overflow to CPU/RAM, so a model larger
+            # than the card can still run. None (no GPU / unset) leaves the
+            # plain device_map="auto" behavior untouched.
+            from ..spill import transformers_max_memory
+
+            max_memory = transformers_max_memory()
+            if max_memory:
+                kwargs["max_memory"] = max_memory
 
         if self.cfg.use_flash_attention:
             kwargs["attn_implementation"] = "flash_attention_2"

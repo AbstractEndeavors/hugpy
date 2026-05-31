@@ -109,3 +109,60 @@
   border-radius: 6px;
   color: #c9d1d9;
 }
+
+.wp-spill {
+  margin-left: auto;
+  margin-right: 8px;
+  font-size: 11px;
+  color: #8b949e;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  padding: 1px 8px;
+}
+.wp-spill em { font-style: normal; color: #6e7681; }
+/* When spill badge is present it takes the auto margin, so the remove button
+   shouldn't also push left. */
+.wp-spill + .wp-remove { margin-left: 0; }
+
+.wp-adv-toggle {
+  padding: 5px 8px;
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  color: #8b949e;
+  cursor: pointer;
+}
+.wp-adv-toggle:hover { background: #2d333b; color: #c9d1d9; }
+
+.wp-spill-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 8px;
+  background: #0f141a;
+  border: 1px dashed #30363d;
+  border-radius: 6px;
+}
+.wp-spill-form label {
+  display: flex;
+  flex-direction: column;
+  font-size: 11px;
+  color: #8b949e;
+  gap: 3px;
+}
+.wp-spill-form input {
+  width: 90px;
+  padding: 4px 6px;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  color: #c9d1d9;
+}
+.wp-spill-hint {
+  font-size: 11px;
+  color: #6e7681;
+  flex: 1 1 100%;
+}
