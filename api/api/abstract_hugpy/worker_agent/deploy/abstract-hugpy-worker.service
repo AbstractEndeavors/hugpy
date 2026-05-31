@@ -1,0 +1,42 @@
+[Unit]
+Description=abstract_hugpy GPU worker (donates this box's GPU to the central console)
+Documentation=https://github.com/AbstractEndeavors/abstractgpt
+# Start after the network — and after WireGuard if you reach central over it.
+After=network-online.target
+Wants=network-online.target
+# If you use wg-quick, uncomment to wait for the tunnel:
+#After=wg-quick@wg0.service
+#Wants=wg-quick@wg0.service
+
+[Service]
+Type=simple
+# Configure everything via the env file (copy from the .env.example).
+EnvironmentFile=/etc/abstract-hugpy-worker.env
+
+# Run the agent module. Adjust the python path / venv as needed:
+#   - system python with abstract_hugpy installed:  /usr/bin/python3
+#   - a venv:  /opt/abstract_hugpy/venv/bin/python
+ExecStart=/usr/bin/python3 -m abstract_hugpy.worker_agent
+
+# Service account + state dir (systemd creates /var/lib/abstract-hugpy-worker).
+User=hugpy
+Group=hugpy
+StateDirectory=abstract-hugpy-worker
+
+# Resilience: restart on crash, keep trying so it rejoins after a reboot or a
+# transient central/WireGuard outage.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+# Let model loads/inference use real time; don't OOM-kill aggressively.
+TimeoutStartSec=0
+KillSignal=SIGINT
+
+# Light hardening (relax if your storage paths need more access).
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

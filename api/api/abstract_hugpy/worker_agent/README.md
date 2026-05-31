@@ -61,6 +61,26 @@ If the worker doesn't have a model's files, it fetches them before loading:
 Files land under the worker's own storage root using the same on-disk layout as
 central, so the loader finds them with no extra config.
 
+## Run as a service (systemd)
+
+To auto-start the agent on boot and restart it on crash, use the unit in
+`deploy/`:
+
+```bash
+cd deploy
+sudo ./install.sh
+sudo nano /etc/abstract-hugpy-worker.env   # set WORKER_CENTRAL_URL etc.
+sudo systemctl start abstract-hugpy-worker
+journalctl -u abstract-hugpy-worker -f
+```
+
+`install.sh` creates a `hugpy` service user + state dir, installs the unit, and
+enables it. All configuration lives in `/etc/abstract-hugpy-worker.env` (copied
+from `deploy/abstract-hugpy-worker.env.example`); re-running the installer never
+clobbers your edited env. If you run abstract_hugpy from a venv, point
+`ExecStart` in the unit at that venv's python. To wait for WireGuard, uncomment
+the `wg-quick@wg0` lines in the unit.
+
 ## Endpoints the agent serves
 
 | Method | Path            | Purpose                                  |
@@ -70,7 +90,19 @@ central, so the loader finds them with no extra config.
 | POST   | `/infer/stream` | SSE `token`/`done`/`error` events        |
 
 `/infer*` accept an optional `spill` dict that overrides the split for the
-model being loaded.
+model being loaded, and an inlined upload (`file_b64` + `file_name`) which the
+agent materializes to a temp file before inference (see below).
+
+## File & image chat offload
+
+Vision/document/audio turns offload to workers too:
+
+- **Images** are already inline base64 in the request, so they ride along to
+  the worker untouched.
+- **Uploaded files** live only on central (under `UPLOADS_HOME`), so central
+  inlines the bytes as base64; the worker rebuilds them to a temp file, runs
+  inference, and deletes the temp file. Files larger than 256 MB are kept on
+  central (run locally) instead of inlining.
 
 ## Notes / limits
 
@@ -79,4 +111,3 @@ model being loaded.
   `CROSS_MACHINE_SPLIT.md` for the design of that future phase.
 - Changing spill for an already-loaded model takes effect on its next load
   (restart the agent, or assign before first use).
-- File/image chat turns currently stay on central (the upload lives there).

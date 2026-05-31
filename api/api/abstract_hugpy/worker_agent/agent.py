@@ -175,20 +175,64 @@ def _ensure_present(payload: dict, central_url: str | None) -> None:
         logger.warning("provisioning check for %s failed: %s", model_key, exc)
 
 
+def _materialize_file(payload: dict) -> str | None:
+    """Rebuild an inlined upload (file_b64/file_name) into a local temp file.
+
+    Central ships uploaded files as base64 since the worker can't see central's
+    UPLOADS_HOME. We write the bytes to a temp file, point ``payload["file"]``
+    at it, and return the temp path so the caller can delete it afterwards.
+    Returns None when there's nothing to materialize.
+    """
+    b64 = payload.pop("file_b64", None)
+    name = payload.pop("file_name", None)
+    if not b64:
+        return None
+    import base64
+    import tempfile
+
+    suffix = ""
+    if name and "." in name:
+        suffix = "." + name.rsplit(".", 1)[-1]
+    fd, tmp_path = tempfile.mkstemp(prefix="hugpy_worker_", suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(base64.b64decode(b64))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    payload["file"] = tmp_path
+    return tmp_path
+
+
+def _cleanup_file(path: str | None) -> None:
+    if path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def _run_once(payload: dict) -> dict:
     from abstract_hugpy.managers.dispatch import execute_prompt
 
-    result = execute_prompt(**payload)
-    if asyncio.iscoroutine(result):
-        result = asyncio.run(result)
+    tmp = _materialize_file(payload)
+    try:
+        result = execute_prompt(**payload)
+        if asyncio.iscoroutine(result):
+            result = asyncio.run(result)
 
-    if getattr(result, "ok", True):
-        return {
-            "ok": True,
-            "text": getattr(result, "text", None) or str(result),
-            "finish_reason": getattr(result, "finish_reason", None) or "stop",
-        }
-    return {"ok": False, "error": getattr(result, "error", None) or "run failed"}
+        if getattr(result, "ok", True):
+            return {
+                "ok": True,
+                "text": getattr(result, "text", None) or str(result),
+                "finish_reason": getattr(result, "finish_reason", None) or "stop",
+            }
+        return {"ok": False, "error": getattr(result, "error", None) or "run failed"}
+    finally:
+        _cleanup_file(tmp)
 
 
 _SPILL_ENV = {
@@ -230,6 +274,7 @@ def _stream_sync(payload: dict):
     """Drive dispatch.execute_prompt_stream (async gen) from Flask's sync ctx."""
     from abstract_hugpy.managers.dispatch import execute_prompt_stream
 
+    tmp = _materialize_file(payload)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     agen = execute_prompt_stream(**payload)
@@ -261,6 +306,7 @@ def _stream_sync(payload: dict):
         except Exception:
             pass
         loop.close()
+        _cleanup_file(tmp)
 
 
 def loaded_model_keys() -> list[str]:

@@ -9,6 +9,38 @@ def sse_event(payload: dict) -> bytes:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+# An uploaded file is shipped to the worker inline (base64) so vision/doc/audio
+# chat can offload too. Above this size we keep the turn local rather than load
+# a huge file into memory + JSON.
+_MAX_WORKER_FILE_BYTES = 256 * 1024 * 1024
+
+
+def _inline_file_for_worker(worker_kwargs: dict) -> bool:
+    """Replace a local upload path with inline bytes the worker can rebuild.
+
+    Central's ``file`` is a path under UPLOADS_HOME that only exists here. Read
+    it, base64 it into ``file_b64`` + ``file_name``, and drop ``file`` so the
+    worker materializes it to its own temp path. Returns False (→ run locally)
+    if the file is missing or too big to inline.
+    """
+    import os
+    import base64
+
+    path = worker_kwargs.get("file")
+    if not path:
+        return True  # nothing to inline; images (if any) go as-is
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) > _MAX_WORKER_FILE_BYTES:
+            return False
+        with open(path, "rb") as fh:
+            worker_kwargs["file_b64"] = base64.b64encode(fh.read()).decode("ascii")
+        worker_kwargs["file_name"] = os.path.basename(path)
+        worker_kwargs.pop("file", None)
+        return True
+    except OSError:
+        return False
+
+
 async def _proxy_worker_stream(worker: dict, prompt_kwargs: dict):
     """Relay an assigned GPU worker's SSE inference stream.
 
@@ -90,10 +122,10 @@ async def stream_events(body: ChatBody):
 
     # ── GPU worker offload ────────────────────────────────────────────────
     # If an online worker is assigned to this model, hand the whole request to
-    # its GPU and relay the stream. File/image turns stay local for now (the
-    # uploaded path lives on this box, not the worker). Any failure before the
-    # worker emits a token falls through to local execution below.
-    offloadable = body.model_key and not body.file and not body.images
+    # its GPU and relay the stream. Images ride along inline (already base64);
+    # an uploaded file is inlined as bytes the worker rebuilds. Any failure
+    # before the worker emits a token falls through to local execution below.
+    offloadable = bool(body.model_key)
     worker = None
     if offloadable:
         try:
@@ -114,6 +146,13 @@ async def stream_events(body: ChatBody):
         except Exception:
             pass
 
+        # Ship any uploaded file to the worker; if it can't be inlined
+        # (missing / too large), skip offload and run this turn locally.
+        if not _inline_file_for_worker(worker_kwargs):
+            logger.info("file too large/absent to offload; running %s locally", body.model_key)
+            worker = None
+
+    if worker:
         produced_any = False
         try:
             async for chunk in _proxy_worker_stream(worker, worker_kwargs):
