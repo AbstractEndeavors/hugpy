@@ -586,6 +586,8 @@ def build_app(state: "WorkerState") -> Flask:
                 "worker_id": state.worker_id,
                 "name": state.name,
                 "gpus": detect_gpus(),
+                "assigned_models": state.assigned_models,
+                "provisioning": sorted(state._provisioning),
                 "loaded_models": loaded_model_keys(),
                 "spill": _spill_describe(),
             }
@@ -634,6 +636,50 @@ class WorkerState:
         self.worker_id = worker_id
         self.central_url = central_url
         self.port = port
+        # Models central says we should serve, plus which we've already kicked
+        # off a background provision for (so we don't re-trigger every beat).
+        self.assigned_models: list[str] = []
+        self._provisioning: set[str] = set()
+        self._provision_lock = threading.Lock()
+
+
+def _sync_assignment(state: "WorkerState", worker: dict) -> None:
+    """React to central's worker record: adopt its model list and pre-provision.
+
+    Central owns the assignment (set in the UI). The agent reads it back from
+    every register/heartbeat response and, for any newly-assigned model it
+    doesn't already have, downloads it in the background so the first chat
+    doesn't pay the full download latency. Without this the worker never knew
+    about UI allocation changes.
+    """
+    if not isinstance(worker, dict):
+        return
+    models = worker.get("models") or []
+    if models == state.assigned_models:
+        return
+    state.assigned_models = list(models)
+    logger.info("assignment updated: serving %s", models or "(nothing)")
+
+    for model_key in models:
+        with state._provision_lock:
+            if model_key in state._provisioning:
+                continue
+            state._provisioning.add(model_key)
+
+        def _bg(mk=model_key):
+            try:
+                from .provision import ensure_model_present, model_is_local
+                if not model_is_local(mk):
+                    logger.info("pre-provisioning assigned model %s…", mk)
+                    ensure_model_present(mk, state.central_url)
+                    logger.info("pre-provisioned %s", mk)
+            except Exception as exc:
+                logger.warning("pre-provision of %s failed: %s", mk, exc)
+            finally:
+                with state._provision_lock:
+                    state._provisioning.discard(mk)
+
+        threading.Thread(target=_bg, daemon=True).start()
 
 
 def _load_worker_id(path: str) -> str | None:
@@ -657,7 +703,7 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
     while True:
         time.sleep(args.heartbeat)
         try:
-            client.heartbeat(
+            worker = client.heartbeat(
                 state.worker_id,
                 {
                     "gpus": detect_gpus(),
@@ -667,6 +713,8 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "port": state.port,
                 },
             )
+            # Adopt any assignment change made in the UI + pre-provision it.
+            _sync_assignment(state, worker)
         except urllib.error.HTTPError as exc:
             if exc.code == 410:
                 # Central forgot us (restart / cleared registry) — re-register.
@@ -693,6 +741,9 @@ def _register(client: CentralClient, state: WorkerState, args) -> None:
     state.worker_id = worker.get("id", state.worker_id)
     if state.worker_id:
         _save_worker_id(args.id_file, state.worker_id)
+    # Adopt central's view of what we serve (it may already have assignments
+    # for this worker_id from a previous session) and pre-provision them.
+    _sync_assignment(state, worker)
     logger.info("registered as worker id=%s serving models=%s", state.worker_id, worker.get("models"))
 
 
