@@ -83,7 +83,16 @@ def _build_http(cfg: VisionBackendConfig) -> VisionBackend:
 
 
 def build_backend(cfg: VisionBackendConfig) -> VisionBackend:
-    name = "http" if cfg.port is not None else "inprocess"
+    import os
+
+    # A worker box has no separate vision server, so a manifest port would send
+    # it to http://none:7002. HUGPY_VISION_INPROCESS=1 forces the in-process
+    # backend (load + run the VL model on this GPU directly), regardless of any
+    # configured port. The worker agent sets this; central leaves it unset and
+    # keeps using its http vision server.
+    force_inprocess = (os.environ.get("HUGPY_VISION_INPROCESS", "").strip().lower()
+                       in ("1", "true", "yes", "on"))
+    name = "inprocess" if (force_inprocess or cfg.port is None) else "http"
     if name not in _BACKENDS:
         raise KeyError(
             f"Unknown vision backend {name!r}. Registered: {list(_BACKENDS)}"

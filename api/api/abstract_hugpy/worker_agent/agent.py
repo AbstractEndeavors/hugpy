@@ -833,6 +833,10 @@ def main(argv: list[str] | None = None) -> int:
 
     _apply_cli_spill(args)
 
+    # A worker runs vision models on its own GPU in-process; it has no separate
+    # vision server to POST to. Force in-process unless the operator overrode it.
+    os.environ.setdefault("HUGPY_VISION_INPROCESS", "1")
+
     # Only advertise a URL when the operator set one explicitly. Otherwise leave
     # it to central, which derives the reachable address from the request source
     # IP — far more reliable than the worker guessing past 127.0.1.1 / NAT / odd

@@ -145,6 +145,22 @@ async def stream_events(body: ChatBody):
     if body.images:
         prompt_kwargs["images"] = body.images
 
+    # Text-only chat to a multi-task (e.g. vision) model: route to its
+    # text-generation task instead of the default image-text-to-text, so a
+    # plain prompt uses the text runner. The vision runner requires an image
+    # and would otherwise fail validation. Only do this when no image is given
+    # and the model actually lists text-generation.
+    if not body.images and not body.file and body.model_key:
+        try:
+            from abstract_hugpy.imports.config.main import get_model_config
+            cfg = get_model_config(body.model_key)
+            tasks = getattr(cfg, "tasks", None) or []
+            primary = getattr(cfg, "primary_task", None)
+            if primary != "text-generation" and "text-generation" in tasks:
+                prompt_kwargs["task"] = "text-generation"
+        except Exception:
+            pass
+
     logger.info("prompt_kwargs == %s", prompt_kwargs)
 
     # ── GPU worker offload ────────────────────────────────────────────────
