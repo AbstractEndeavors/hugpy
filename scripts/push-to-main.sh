@@ -31,11 +31,23 @@ if [[ "$current" != "$BRANCH" ]]; then
   git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH" --track "origin/$BRANCH"
 fi
 
+# Drop anything that's tracked but should be ignored (build output, deps,
+# logs, __pycache__). On first run against an old checkout these may still be
+# committed; --cached untracks them without deleting the files on disk.
+tracked_ignored="$(git ls-files -i -c --exclude-standard || true)"
+if [[ -n "$tracked_ignored" ]]; then
+  echo "Untracking ignored files that were previously committed…"
+  printf '%s\n' "$tracked_ignored" | sed 's/^/  - /'
+  printf '%s\n' "$tracked_ignored" | tr '\n' '\0' | xargs -0 -r git rm -r --cached --quiet
+fi
+
 # Nothing to do?
 if [[ -z "$(git status --porcelain)" ]]; then
   echo "Working tree clean — nothing to commit."
 else
   echo "Staging and committing changes…"
+  # .gitignore keeps app/dist, app/node_modules, app/yarn.lock, *.log and
+  # __pycache__ out of `git add -A`.
   git add -A
   git commit -m "$MSG"
 fi

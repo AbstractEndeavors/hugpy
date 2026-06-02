@@ -1,0 +1,11 @@
+# Build / dependency output
+app/dist/
+app/node_modules/
+app/yarn.lock
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Logs
+*.log
