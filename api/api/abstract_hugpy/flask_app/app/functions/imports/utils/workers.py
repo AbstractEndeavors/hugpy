@@ -210,6 +210,7 @@ class WorkerStore:
         gpus: Optional[List[Dict[str, Any]]] = None,
         loaded_models: Optional[List[str]] = None,
         spill: Optional[Dict[str, Any]] = None,
+        url: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a worker alive and refresh its live GPU / loaded-model stats."""
         with self._transaction() as workers:
@@ -217,6 +218,8 @@ class WorkerStore:
             if worker is None:
                 return None
             worker["last_seen"] = _now()
+            if url:
+                worker["url"] = url.rstrip("/")
             if gpus is not None:
                 worker["gpus"] = gpus
             if loaded_models is not None:

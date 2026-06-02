@@ -24,7 +24,7 @@ llm_storage_routes.py pulls its registry helpers.
 import os
 
 from pydantic import BaseModel, Field
-from flask import request, jsonify, abort, send_file
+from flask import request, jsonify, abort, send_file, Response
 
 from ..functions import *
 
@@ -40,17 +40,64 @@ class GpuInfo(BaseModel):
 
 class RegisterRequest(BaseModel):
     name: str
-    url: str = Field(..., examples=["http://10.0.0.5:9100"])
+    # Optional: the worker may advertise its own callback URL, but central will
+    # override it with the request's real source IP when the worker can't tell
+    # what address is actually reachable (loopback / 127.0.1.1 / NAT / bad NIC).
+    url: str | None = Field(default=None, examples=["http://10.0.0.5:9100"])
+    port: int | None = 9100
     gpus: list[GpuInfo] = Field(default_factory=list)
     role: str = "worker"
     models: list[str] | None = None
     worker_id: str | None = None
 
 
+# Hostnames/IPs a worker might self-report that are NOT reachable from central.
+_UNREACHABLE_HOSTS = {"127.0.0.1", "127.0.1.1", "localhost", "0.0.0.0", "::1", ""}
+
+
+def _client_ip() -> str:
+    """The worker's real source IP as seen by central.
+
+    Honors X-Forwarded-For (left-most) when behind nginx/a proxy, else the raw
+    socket peer. This is the address central can actually call back on.
+    """
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.remote_addr or ""
+
+
+def _host_of(url: str) -> str:
+    from urllib.parse import urlparse
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _resolve_worker_url(advertised: str | None, port: int | None) -> str:
+    """Pick the callback URL central will store for a worker.
+
+    If the worker advertised a usable host, trust it. Otherwise (no URL, or a
+    loopback/bogus host) build one from the request's source IP + the port.
+    """
+    if advertised:
+        host = _host_of(advertised)
+        if host and host not in _UNREACHABLE_HOSTS:
+            return advertised.rstrip("/")
+    ip = _client_ip()
+    p = port or 9100
+    # IPv6 literal needs brackets.
+    host = f"[{ip}]" if ":" in ip else ip
+    return f"http://{host}:{p}"
+
+
 class HeartbeatRequest(BaseModel):
     gpus: list[GpuInfo] | None = None
     loaded_models: list[str] | None = None
     spill: dict | None = None
+    url: str | None = None
+    port: int | None = None
 
 
 class AssignRequest(BaseModel):
@@ -69,9 +116,12 @@ def workers_list():
 @worker_bp.route("/llm/workers/register", methods=["POST"])
 def workers_register():
     body = RegisterRequest(**(request.get_json(silent=True) or {}))
+    # Central decides the reachable callback URL from the request source IP when
+    # the worker can't self-report a usable address.
+    url = _resolve_worker_url(body.url, body.port)
     worker = register_worker(
         name=body.name,
-        url=body.url,
+        url=url,
         gpus=[g.model_dump() for g in body.gpus],
         role=body.role,
         models=body.models,
@@ -115,11 +165,15 @@ def workers_health(worker_id):
 @worker_bp.route("/llm/workers/<worker_id>/heartbeat", methods=["POST"])
 def workers_heartbeat(worker_id):
     body = HeartbeatRequest(**(request.get_json(silent=True) or {}))
+    # Keep the callback URL correct as the network sees it — fixes workers that
+    # first registered (in an older agent) with a loopback/bogus address.
+    url = _resolve_worker_url(body.url, body.port)
     worker = heartbeat_worker(
         worker_id,
         gpus=[g.model_dump() for g in body.gpus] if body.gpus is not None else None,
         loaded_models=body.loaded_models,
         spill=body.spill,
+        url=url,
     )
     if worker is None:
         # The agent thinks it's registered but central forgot it (restart,
@@ -225,3 +279,63 @@ def model_file(model_key):
     return send_file(target, as_attachment=True,
                      download_name=os.path.basename(target),
                      conditional=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Central-driven worker install.
+#
+# An operator on a GPU box runs ONE command; everything else (where to find the
+# agent, which central to call back, the port) is supplied by central here, so
+# the worker doesn't need to be pre-configured:
+#
+#     curl -fsSL https://abstractgpt.ai/api/llm/workers/install.sh | bash
+#
+# The script makes sure abstract_hugpy is importable, then launches the agent
+# pointed at THIS central (derived from the request host). Override port/name
+# with env vars before the pipe, e.g.  WORKER_PORT=9101 WORKER_NAME=gpu2 bash.
+# ──────────────────────────────────────────────────────────────────────────
+def _central_base_url() -> str:
+    """The externally-visible base URL of this central node, from the request."""
+    # Honor proxy headers so we emit the public https URL, not the gunicorn host.
+    proto = request.headers.get("X-Forwarded-Proto", request.scheme)
+    host = request.headers.get("X-Forwarded-Host") or request.host
+    return f"{proto}://{host}"
+
+
+@worker_bp.route("/llm/workers/install.sh", methods=["GET"])
+def worker_install_script():
+    central = _central_base_url()
+    script = f"""#!/usr/bin/env bash
+# abstract_hugpy GPU worker — one-line installer (served by central).
+set -euo pipefail
+
+CENTRAL="${{WORKER_CENTRAL_URL:-{central}}}"
+PORT="${{WORKER_PORT:-9100}}"
+NAME="${{WORKER_NAME:-$(hostname)}}"
+PY="${{WORKER_PYTHON:-python3}}"
+
+echo "abstract_hugpy worker installer"
+echo "  central : $CENTRAL"
+echo "  name    : $NAME"
+echo "  port    : $PORT"
+echo "  python  : $PY"
+
+# 1. Ensure abstract_hugpy is importable. If not, tell the operator how to get
+#    it rather than guessing their environment.
+if ! "$PY" -c "import abstract_hugpy" 2>/dev/null; then
+  echo "error: '$PY' cannot import abstract_hugpy." >&2
+  echo "Install it in the env you want to run the worker from, then re-run:" >&2
+  echo "  pip install abstract_hugpy   # or activate your conda/venv first" >&2
+  exit 1
+fi
+
+# 2. Launch the agent. Central derives this box's reachable address from the
+#    connection, so we don't need to know our own IP. Runs in the foreground;
+#    wrap with systemd/nohup/tmux to keep it alive (see the deploy/ unit).
+echo "Starting worker agent (Ctrl-C to stop)…"
+exec "$PY" -m abstract_hugpy.worker_agent \\
+    --central "$CENTRAL" \\
+    --name "$NAME" \\
+    --port "$PORT"
+"""
+    return Response(script, mimetype="text/x-shellscript")

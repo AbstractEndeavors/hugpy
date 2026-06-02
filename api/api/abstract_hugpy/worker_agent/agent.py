@@ -376,12 +376,13 @@ def build_app(state: "WorkerState") -> Flask:
 # Agent lifecycle
 # ---------------------------------------------------------------------------
 class WorkerState:
-    def __init__(self, name: str, url: str, worker_id: str | None,
-                 central_url: str | None = None):
+    def __init__(self, name: str, url: str | None, worker_id: str | None,
+                 central_url: str | None = None, port: int | None = None):
         self.name = name
-        self.url = url
+        self.url = url            # None unless operator set --advertise/WORKER_URL
         self.worker_id = worker_id
         self.central_url = central_url
+        self.port = port
 
 
 def _load_worker_id(path: str) -> str | None:
@@ -411,6 +412,8 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "gpus": detect_gpus(),
                     "loaded_models": loaded_model_keys(),
                     "spill": _spill_describe(),
+                    "url": state.url,     # None -> central keeps source-IP URL
+                    "port": state.port,
                 },
             )
         except urllib.error.HTTPError as exc:
@@ -428,7 +431,8 @@ def _register(client: CentralClient, state: WorkerState, args) -> None:
     models = [m.strip() for m in (args.models or "").split(",") if m.strip()]
     payload = {
         "name": state.name,
-        "url": state.url,
+        "url": state.url,            # None -> central uses the source IP
+        "port": state.port,
         "gpus": detect_gpus(),
         "role": "worker",
         "models": models or None,
@@ -513,14 +517,15 @@ def main(argv: list[str] | None = None) -> int:
 
     _apply_cli_spill(args)
 
-    advertise = args.advertise
-    if not advertise:
-        host = args.host if args.host not in ("0.0.0.0", "::") else socket.gethostbyname(socket.gethostname())
-        advertise = f"http://{host}:{args.port}"
-
+    # Only advertise a URL when the operator set one explicitly. Otherwise leave
+    # it to central, which derives the reachable address from the request source
+    # IP — far more reliable than the worker guessing past 127.0.1.1 / NAT / odd
+    # NICs. We still send the listen port so central can build host:port.
+    advertise = args.advertise  # may be None
     state = WorkerState(name=args.name, url=advertise,
                         worker_id=_load_worker_id(args.id_file),
                         central_url=args.central)
+    state.port = args.port
     client = CentralClient(args.central)
 
     try:

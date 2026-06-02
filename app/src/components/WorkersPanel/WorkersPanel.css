@@ -184,3 +184,50 @@
 }
 .wp-ping-ok  { color: #3fb950; background: #102a16; border: 1px solid #1c5a2c; }
 .wp-ping-bad { color: #f85149; background: #2d1113; border: 1px solid #6e2b2b; }
+
+.wp-prune {
+  font-size: 11px;
+  padding: 2px 8px;
+  margin-left: 4px;
+  background: #2d1113;
+  border: 1px solid #6e2b2b;
+  border-radius: 6px;
+  color: #f0a0a0;
+  cursor: pointer;
+}
+.wp-prune:hover { background: #3a1518; }
+
+.wp-install {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px;
+  margin-bottom: 10px;
+  background: #0f141a;
+  border: 1px solid #1c5a2c;
+  border-radius: 8px;
+}
+.wp-install-label { font-size: 12px; color: #8b949e; }
+.wp-install-cmd {
+  display: block;
+  font-family: monospace;
+  font-size: 12px;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: #3fb950;
+  cursor: pointer;
+  word-break: break-all;
+}
+.wp-install-cmd:hover { border-color: #3fb950; }
+.wp-install-note { font-size: 11px; color: #6e7681; }
+
+.wp-manual { margin-bottom: 10px; }
+.wp-manual summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: #8b949e;
+  padding: 4px 0;
+}
+.wp-manual summary:hover { color: #c9d1d9; }

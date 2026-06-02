@@ -181,17 +181,18 @@ export default function WorkersPanel({ models = [] }) {
 
   const register = useCallback(async (e) => {
     e.preventDefault()
-    if (!form.name.trim() || !form.url.trim()) return
+    if (!form.name.trim()) return   // url is optional; central uses source IP
     setBusy(true)
     try {
+      const body = {
+        name: form.name.trim(),
+        models: form.models.split(',').map(s => s.trim()).filter(Boolean),
+      }
+      if (form.url.trim()) body.url = form.url.trim()
       await fetchJson('/api/llm/workers/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: form.name.trim(),
-          url: form.url.trim(),
-          models: form.models.split(',').map(s => s.trim()).filter(Boolean),
-        }),
+        body: JSON.stringify(body),
       })
       setForm({ name: '', url: '', models: '' })
       load()
@@ -234,7 +235,21 @@ export default function WorkersPanel({ models = [] }) {
     } catch (err) { alert(`Remove failed: ${err.message}`) }
   }, [load])
 
+  // Drop every offline worker (e.g. stale entries left by an old agent).
+  const pruneOffline = useCallback(async () => {
+    const stale = workers.filter(w => w.status !== 'online')
+    if (!stale.length) return
+    if (!confirm(`Remove ${stale.length} offline worker(s) from the pool?`)) return
+    await Promise.all(stale.map(w =>
+      fetchJson(`/api/llm/workers/${encodeURIComponent(w.id)}`, { method: 'DELETE' }).catch(() => {})
+    ))
+    load()
+  }, [workers, load])
+
   const onlineCount = workers.filter(w => w.status === 'online').length
+  const offlineCount = workers.length - onlineCount
+  // One-line installer served by THIS central node (host derived server-side).
+  const installCmd = `curl -fsSL ${window.location.origin}/api/llm/workers/install.sh | bash`
 
   return (
     <div className="workers-panel">
@@ -242,34 +257,50 @@ export default function WorkersPanel({ models = [] }) {
         <span className="wp-title">🖧 GPU Workers</span>
         <span className="wp-count">{onlineCount} online / {workers.length} total</span>
         {error && <span className="wp-err" title={error}>registry error</span>}
+        {offlineCount > 0 && (
+          <button
+            className="wp-prune"
+            title="Remove all offline workers"
+            onClick={e => { e.stopPropagation(); pruneOffline() }}
+          >clear {offlineCount} offline</button>
+        )}
         <span className="wp-toggle">{open ? '▾' : '▸'}</span>
       </div>
 
       {open && (
         <div className="wp-body">
-          <form className="wp-register" onSubmit={register}>
-            <input
-              placeholder="worker name (e.g. gpu-box-1)"
-              value={form.name}
-              onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
-            />
-            <input
-              placeholder="worker URL (e.g. http://10.0.0.5:9100)"
-              value={form.url}
-              onChange={e => setForm(f => ({ ...f, url: e.target.value }))}
-            />
-            <input
-              placeholder="models to serve (optional, comma-separated keys)"
-              value={form.models}
-              onChange={e => setForm(f => ({ ...f, models: e.target.value }))}
-            />
-            <button type="submit" disabled={busy}>+ Add worker</button>
-          </form>
-          <p className="wp-hint">
-            Workers normally self-register by running
-            <code> python -m abstract_hugpy.worker_agent --central &lt;this host&gt; </code>
-            on the GPU box. Use the form above to add one manually.
-          </p>
+          <div className="wp-install">
+            <span className="wp-install-label">Add a GPU box — run on the worker:</span>
+            <code className="wp-install-cmd" title="Click to copy"
+                  onClick={() => navigator.clipboard?.writeText(installCmd)}>
+              {installCmd}
+            </code>
+            <span className="wp-install-note">
+              Central fills in its own address and this box's reachable IP — no per-worker config.
+            </span>
+          </div>
+
+          <details className="wp-manual">
+            <summary>Add manually</summary>
+            <form className="wp-register" onSubmit={register}>
+              <input
+                placeholder="worker name (e.g. gpu-box-1)"
+                value={form.name}
+                onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+              />
+              <input
+                placeholder="worker URL (optional — central uses source IP)"
+                value={form.url}
+                onChange={e => setForm(f => ({ ...f, url: e.target.value }))}
+              />
+              <input
+                placeholder="models to serve (optional, comma-separated keys)"
+                value={form.models}
+                onChange={e => setForm(f => ({ ...f, models: e.target.value }))}
+              />
+              <button type="submit" disabled={busy}>+ Add worker</button>
+            </form>
+          </details>
 
           {workers.length === 0 && <div className="wp-empty">No workers have joined the pool yet.</div>}
           {workers.map(w => (
