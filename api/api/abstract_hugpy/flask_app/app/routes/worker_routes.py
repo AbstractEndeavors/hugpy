@@ -318,11 +318,18 @@ PY="${WORKER_PYTHON:-}"
 # SYSTEMD=1 installs+enables a user service (auto-start on boot); default just
 # runs in the foreground. SYSTEMD=0 to force foreground.
 SYSTEMD="${SYSTEMD:-ask}"
+# Where the worker stores models it pulls from central. A worker does NOT need
+# central's /mnt mount: it downloads each model once over HTTP (resumable) and
+# caches it locally, which is faster than serving weights live over sshfs/NFS.
+# Default to a local dir so a missing/broken /mnt never matters; override with
+# DEFAULT_ROOT.
+export DEFAULT_ROOT="${DEFAULT_ROOT:-$HOME/.abstract_hugpy/storage}"
 
 echo "abstract_hugpy worker installer"
 echo "  central : $CENTRAL"
 echo "  name    : $NAME"
 echo "  port    : $PORT"
+echo "  storage : $DEFAULT_ROOT"
 
 has_hugpy() { "$1" -c "import abstract_hugpy" >/dev/null 2>&1; }
 
@@ -420,6 +427,7 @@ Type=simple
 Environment=WORKER_CENTRAL_URL=$CENTRAL
 Environment=WORKER_NAME=$NAME
 Environment=WORKER_PORT=$PORT
+Environment=DEFAULT_ROOT=$DEFAULT_ROOT
 ExecStart=$PY -m abstract_hugpy.worker_agent --central $CENTRAL --name $NAME --port $PORT
 Restart=always
 RestartSec=5
