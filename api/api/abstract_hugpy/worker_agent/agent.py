@@ -379,8 +379,10 @@ def _apply_spill(spill: dict | None) -> None:
         os.environ[env_name] = str(val)
 
 
-def _sse(payload: dict) -> str:
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+def _sse(payload: dict) -> bytes:
+    # werkzeug's WSGI server asserts the app yields bytes, not str — so encode
+    # here. (gunicorn is more lenient, but the worker runs the dev server.)
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 # How many continuation passes we'll chain before giving up, so a runaway
