@@ -22,11 +22,20 @@
 set -euo pipefail
 
 ROOT="${ROOT:-/srv/abstractgpt/abstractgpt}"
-REPO_URL="${REPO_URL:-https://github.com/AbstractEndeavors/abstractgpt.git}"
+# SSH by default — GitHub no longer accepts password auth over HTTPS, so a
+# bare HTTPS URL just prompts forever on a server. Override with REPO_URL for
+# an HTTPS+token remote, e.g.
+#   REPO_URL=https://<user>:<token>@github.com/AbstractEndeavors/abstractgpt.git
+REPO_URL="${REPO_URL:-git@github.com:AbstractEndeavors/abstractgpt.git}"
 BRANCH="${BRANCH:-main}"
 SERVICE="${SERVICE:-6092_abstractgpt_api}"
 TS="$(date '+%Y%m%d_%H%M%S')"
 PREV="$ROOT/prev/$TS"
+
+# Never block on an interactive credential prompt — fail fast with guidance
+# instead of looping forever asking for a username/password.
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}"
 
 if [[ ! -d "$ROOT" ]]; then
   echo "error: $ROOT does not exist" >&2
@@ -43,7 +52,20 @@ echo "Cloning $REPO_URL ($BRANCH)…"
 n=0
 until git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TMP/repo"; do
   n=$((n + 1))
-  if (( n > 4 )); then echo "error: git clone failed" >&2; exit 1; fi
+  if (( n > 4 )); then
+    echo "error: git clone failed." >&2
+    cat >&2 <<EOF
+
+Authentication likely failed. GitHub does NOT accept account passwords for git.
+Pick one:
+  • SSH (recommended): ensure 'ssh -T git@github.com' greets you, then re-run.
+  • HTTPS + token: re-run with a Personal Access Token (repo scope), e.g.
+      REPO_URL=https://putkoff:<TOKEN>@github.com/AbstractEndeavors/abstractgpt.git \\
+        ./scripts/pull-from-main.sh
+The username is always your personal account (putkoff), not the org.
+EOF
+    exit 1
+  fi
   echo "clone failed (attempt $n), retrying…"; rm -rf "$TMP/repo"; sleep $((2 ** n))
 done
 
