@@ -330,6 +330,13 @@ class WorkerStore:
         """
         candidates = self.workers_for_model(model_key, online_only=True)
         if not candidates:
+            # Fall back to assigned workers even with a stale heartbeat. Heartbeat
+            # (worker->central) can time out when central is briefly slow, while
+            # offload (central->worker) still works — so an assigned worker that
+            # looks "offline" is often still serviceable. The stream proxy fails
+            # fast to local if the worker is genuinely unreachable.
+            candidates = self.workers_for_model(model_key, online_only=False)
+        if not candidates:
             return None
 
         warm = [w for w in candidates if model_key in (w.get("loaded_models") or [])]

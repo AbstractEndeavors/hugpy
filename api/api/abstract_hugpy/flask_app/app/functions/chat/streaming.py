@@ -52,7 +52,9 @@ async def _proxy_worker_stream(worker: dict, prompt_kwargs: dict):
     import httpx
 
     url = worker["url"].rstrip("/") + "/infer/stream"
-    timeout = httpx.Timeout(600.0, connect=10.0)
+    # Short connect timeout so a genuinely-dead worker fails over to local fast;
+    # long read timeout because generation itself can take a while.
+    timeout = httpx.Timeout(600.0, connect=4.0)
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", url, json=prompt_kwargs) as resp:

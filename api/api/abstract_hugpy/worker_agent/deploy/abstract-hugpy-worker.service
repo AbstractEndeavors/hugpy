@@ -7,6 +7,8 @@ Wants=network-online.target
 # If you use wg-quick, uncomment to wait for the tunnel:
 #After=wg-quick@wg0.service
 #Wants=wg-quick@wg0.service
+# Restart-throttle window lives in [Unit] (NOT [Service]); 0 = never give up.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -34,7 +36,6 @@ SupplementaryGroups=video render
 # transient central/WireGuard outage.
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 
 # Model loads/inference can take a while; don't time out or OOM-kill eagerly.
 TimeoutStartSec=0
@@ -48,8 +49,9 @@ KillSignal=SIGINT
 #ProtectSystem=strict
 #ProtectHome=read-only
 # Writable paths the worker needs (state dir is already writable). Add your
-# model storage root (DEFAULT_ROOT) so provisioning can write models:
-#ReadWritePaths=/mnt/llm_storage /var/lib/abstract-hugpy-worker
+# model storage root (DEFAULT_ROOT) so provisioning can write models. A worker
+# uses LOCAL storage (no central mount), e.g. ~hugpy/.abstract_hugpy/storage:
+#ReadWritePaths=/home/hugpy/.abstract_hugpy/storage /var/lib/abstract-hugpy-worker
 # Explicitly allow the GPU device nodes when using DevicePolicy:
 #DeviceAllow=/dev/nvidiactl rw
 #DeviceAllow=/dev/nvidia0 rw
