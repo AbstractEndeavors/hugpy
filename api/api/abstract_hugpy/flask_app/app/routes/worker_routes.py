@@ -305,37 +305,113 @@ def _central_base_url() -> str:
 @worker_bp.route("/llm/workers/install.sh", methods=["GET"])
 def worker_install_script():
     central = _central_base_url()
-    script = f"""#!/usr/bin/env bash
+    script = r"""#!/usr/bin/env bash
 # abstract_hugpy GPU worker — one-line installer (served by central).
 set -euo pipefail
 
-CENTRAL="${{WORKER_CENTRAL_URL:-{central}}}"
-PORT="${{WORKER_PORT:-9100}}"
-NAME="${{WORKER_NAME:-$(hostname)}}"
-PY="${{WORKER_PYTHON:-python3}}"
+CENTRAL="${WORKER_CENTRAL_URL:-__CENTRAL__}"
+PORT="${WORKER_PORT:-9100}"
+NAME="${WORKER_NAME:-$(hostname)}"
+# WORKER_PYTHON forces a specific interpreter; otherwise we auto-detect one that
+# already has abstract_hugpy installed.
+PY="${WORKER_PYTHON:-}"
+# SYSTEMD=1 installs+enables a user service (auto-start on boot); default just
+# runs in the foreground. SYSTEMD=0 to force foreground.
+SYSTEMD="${SYSTEMD:-ask}"
 
 echo "abstract_hugpy worker installer"
 echo "  central : $CENTRAL"
 echo "  name    : $NAME"
 echo "  port    : $PORT"
+
+has_hugpy() { "$1" -c "import abstract_hugpy" >/dev/null 2>&1; }
+
+# 1. Find a python that can import abstract_hugpy.
+if [[ -n "$PY" ]]; then
+  if ! has_hugpy "$PY"; then
+    echo "error: WORKER_PYTHON=$PY cannot import abstract_hugpy." >&2; exit 1
+  fi
+else
+  echo "Searching for a python with abstract_hugpy…"
+  CANDIDATES=()
+  # current PATH pythons
+  for c in python3 python; do command -v "$c" >/dev/null 2>&1 && CANDIDATES+=("$(command -v "$c")"); done
+  # conda envs
+  for base in "$HOME/miniconda3" "$HOME/miniforge3" "$HOME/anaconda3" \
+              /opt/*/miniconda3 /opt/*/miniforge3 /opt/conda; do
+    for p in "$base"/bin/python3 "$base"/envs/*/bin/python3; do
+      [[ -x "$p" ]] && CANDIDATES+=("$p")
+    done
+  done
+  # common venv locations
+  for p in /opt/*/venv/bin/python3 "$HOME"/.virtualenvs/*/bin/python3 \
+           /srv/*/venv/bin/python3; do
+    [[ -x "$p" ]] && CANDIDATES+=("$p")
+  done
+  for cand in "${CANDIDATES[@]}"; do
+    if has_hugpy "$cand"; then PY="$cand"; break; fi
+  done
+  if [[ -z "$PY" ]]; then
+    echo "error: could not find any python with abstract_hugpy installed." >&2
+    echo "Install it in your env (pip install abstract_hugpy), or re-run with" >&2
+    echo "  WORKER_PYTHON=/path/to/python  curl -fsSL $CENTRAL/api/llm/workers/install.sh | bash" >&2
+    exit 1
+  fi
+fi
 echo "  python  : $PY"
 
-# 1. Ensure abstract_hugpy is importable. If not, tell the operator how to get
-#    it rather than guessing their environment.
-if ! "$PY" -c "import abstract_hugpy" 2>/dev/null; then
-  echo "error: '$PY' cannot import abstract_hugpy." >&2
-  echo "Install it in the env you want to run the worker from, then re-run:" >&2
-  echo "  pip install abstract_hugpy   # or activate your conda/venv first" >&2
-  exit 1
+RUN_CMD=("$PY" -m abstract_hugpy.worker_agent --central "$CENTRAL" --name "$NAME" --port "$PORT")
+
+# 2. Optionally install a systemd --user service so it auto-starts on boot.
+maybe_systemd() {
+  command -v systemctl >/dev/null 2>&1 || { echo "systemctl not found; running foreground."; return 1; }
+  if [[ "$SYSTEMD" == "ask" ]]; then
+    if [[ -t 0 ]]; then
+      read -r -p "Install a systemd --user service so it auto-starts on boot? [y/N] " ans
+      [[ "$ans" =~ ^[Yy] ]] || return 1
+    else
+      # piped (curl|bash) with no TTY: default to foreground unless SYSTEMD=1.
+      return 1
+    fi
+  elif [[ "$SYSTEMD" != "1" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+if maybe_systemd; then
+  UDIR="$HOME/.config/systemd/user"
+  mkdir -p "$UDIR"
+  cat > "$UDIR/abstract-hugpy-worker.service" <<UNIT
+[Unit]
+Description=abstract_hugpy GPU worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=WORKER_CENTRAL_URL=$CENTRAL
+Environment=WORKER_NAME=$NAME
+Environment=WORKER_PORT=$PORT
+ExecStart=$PY -m abstract_hugpy.worker_agent --central $CENTRAL --name $NAME --port $PORT
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+  systemctl --user daemon-reload
+  systemctl --user enable --now abstract-hugpy-worker.service
+  # Let the service keep running after logout.
+  command -v loginctl >/dev/null 2>&1 && loginctl enable-linger "$USER" 2>/dev/null || true
+  echo "✓ Installed user service. Logs: journalctl --user -u abstract-hugpy-worker -f"
+  exit 0
 fi
 
-# 2. Launch the agent. Central derives this box's reachable address from the
-#    connection, so we don't need to know our own IP. Runs in the foreground;
-#    wrap with systemd/nohup/tmux to keep it alive (see the deploy/ unit).
-echo "Starting worker agent (Ctrl-C to stop)…"
-exec "$PY" -m abstract_hugpy.worker_agent \\
-    --central "$CENTRAL" \\
-    --name "$NAME" \\
-    --port "$PORT"
+# 3. Foreground run.
+echo "Starting worker agent in the foreground (Ctrl-C to stop)…"
+exec "${RUN_CMD[@]}"
 """
+    script = script.replace("__CENTRAL__", central)
     return Response(script, mimetype="text/x-shellscript")
+
