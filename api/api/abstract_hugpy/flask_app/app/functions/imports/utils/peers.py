@@ -3,17 +3,67 @@ from __future__ import annotations
 import os
 import shutil
 import socket
+import threading
+import time
 from typing import Any
 
 from .schemas import settings
 
 
-def _disk(path: str) -> dict[str, int | None]:
+# describe_self() is polled by the console every ~15s. It touches the storage
+# mount (exists + disk_usage), which BLOCKS for the mount timeout on a degraded
+# NFS/sshfs share — stalling gunicorn workers and making the whole console slow.
+# So we (a) run the probe with a hard timeout in a thread and (b) cache the
+# result briefly, so a sick mount degrades to "unknown disk" instantly instead
+# of hanging every request.
+_DISK_CACHE: dict[str, Any] = {"at": 0.0, "value": None, "mounted": None}
+_DISK_CACHE_TTL = 30.0
+_DISK_PROBE_TIMEOUT = 1.5
+_DISK_LOCK = threading.Lock()
+
+
+def _disk_raw(path: str) -> dict[str, int | None]:
     try:
         usage = shutil.disk_usage(path if os.path.exists(path) else "/")
         return {"total": usage.total, "used": usage.used, "free": usage.free}
     except OSError:
         return {"total": None, "used": None, "free": None}
+
+
+def _probe_storage(path: str) -> tuple[dict[str, int | None], bool]:
+    """Run the (potentially blocking) mount probe with a hard timeout.
+
+    Returns (disk_info, mounted). On timeout/hang we return unknowns rather than
+    blocking the request thread, so a degraded mount can't take the API down.
+    """
+    result: dict[str, Any] = {}
+
+    def _work():
+        result["disk"] = _disk_raw(path)
+        result["mounted"] = os.path.exists(path)
+
+    t = threading.Thread(target=_work, daemon=True)
+    t.start()
+    t.join(_DISK_PROBE_TIMEOUT)
+    if t.is_alive():
+        # Probe is stuck on a hung mount — report unknown, don't wait for it.
+        return {"total": None, "used": None, "free": None}, False
+    return result.get("disk", {"total": None, "used": None, "free": None}), bool(result.get("mounted"))
+
+
+def _disk_cached(path: str) -> tuple[dict[str, int | None], bool]:
+    now = time.time()
+    with _DISK_LOCK:
+        if _DISK_CACHE["value"] is not None and (now - _DISK_CACHE["at"]) < _DISK_CACHE_TTL:
+            return _DISK_CACHE["value"], _DISK_CACHE["mounted"]
+    disk, mounted = _probe_storage(path)
+    with _DISK_LOCK:
+        _DISK_CACHE.update(at=now, value=disk, mounted=mounted)
+    return disk, mounted
+
+
+def _disk(path: str) -> dict[str, int | None]:
+    return _disk_cached(path)[0]
 
 
 def describe_self() -> dict[str, Any]:
@@ -22,14 +72,16 @@ def describe_self() -> dict[str, Any]:
     role = os.environ.get("LLM_PEER_ROLE", "central")
     name = os.environ.get("LLM_PEER_NAME", hostname)
 
+    disk, mounted = _disk_cached(str(settings.storage_root))
+
     return {
         "name": name,
         "host": hostname,
         "role": role,
         "storage_root": str(settings.storage_root),
         "manifest_path": str(settings.manifest_path),
-        "storage_mounted": os.path.exists(settings.storage_root),
-        "disk": _disk(settings.storage_root),
+        "storage_mounted": mounted,
+        "disk": disk,
         "status": "online",
     }
 

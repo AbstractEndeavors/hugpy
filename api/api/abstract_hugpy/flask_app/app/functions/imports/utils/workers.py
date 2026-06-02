@@ -72,9 +72,17 @@ class WorkerStore:
     keeps threads within one process from racing the same fd.
     """
 
+    # Read-cache TTL: the console polls /llm/workers every ~10s; without this
+    # every poll does an open+flock+read of workers.json, which BLOCKS on a
+    # degraded mount and stalls the API. Reads serve from cache within the TTL;
+    # writes always go to disk and refresh the cache, so liveness stays correct.
+    _READ_TTL = 3.0
+
     def __init__(self, path: Optional[str] = None) -> None:
         self._path = path or _default_workers_path()
         self._lock = threading.RLock()
+        self._cache: Optional[Dict[str, Dict[str, Any]]] = None
+        self._cache_at = 0.0
         self._ensure_parent()
 
     # -- persistence (disk-authoritative) ----------------------------------
@@ -119,9 +127,20 @@ class WorkerStore:
             pass
 
     def _load(self) -> Dict[str, Dict[str, Any]]:
-        """Read-only snapshot of the current registry from disk."""
+        """Read-only snapshot of the registry, cached for a few seconds.
+
+        Polls (list/get/pick) hit this; the cache keeps a hung/slow mount from
+        blocking every request. Writes refresh the cache, so freshly-registered
+        or reassigned workers are visible immediately to the writing process.
+        """
+        now = time.time()
         with self._lock:
-            return self._read_unlocked()
+            if self._cache is not None and (now - self._cache_at) < self._READ_TTL:
+                return self._cache
+            data = self._read_unlocked()
+            self._cache = data
+            self._cache_at = now
+            return data
 
     @contextmanager
     def _transaction(self):
@@ -142,6 +161,10 @@ class WorkerStore:
                 workers = self._read_unlocked(fh)
                 yield workers
                 self._write_unlocked(fh, workers)
+                # Refresh the read-cache so this process sees its own write
+                # immediately (and other processes within the TTL).
+                self._cache = workers
+                self._cache_at = time.time()
             finally:
                 try:
                     if fcntl is not None:
