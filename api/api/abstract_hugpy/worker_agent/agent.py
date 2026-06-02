@@ -387,6 +387,23 @@ def _sse(payload: dict) -> str:
 # model can't loop forever. Each pass produces up to the per-call token cap.
 _MAX_CONTINUATIONS = int(os.environ.get("WORKER_MAX_CONTINUATIONS", "20"))
 
+# At a continuation seam, a model often re-emits the tail of the previous part.
+# We look for an overlap up to this many characters and drop it.
+_SEAM_WINDOW = int(os.environ.get("WORKER_SEAM_WINDOW", "400"))
+
+
+def _overlap_len(prev_tail: str, seg: str) -> int:
+    """Longest suffix of prev_tail that is also a prefix of seg.
+
+    Used to strip a continuation seam where the model repeats text it already
+    produced. Exact match (verbatim repetition is by far the common case).
+    """
+    maxk = min(len(prev_tail), len(seg))
+    for k in range(maxk, 0, -1):
+        if prev_tail.endswith(seg[:k]):
+            return k
+    return 0
+
 
 def _run_one_pass(loop, payload: dict):
     """Run a single execute_prompt_stream pass.
@@ -454,21 +471,59 @@ def _stream_sync(payload: dict):
                             "segment": attempt + 1})
 
             gen = _run_one_pass(loop, pass_kwargs)
-            seg_text = ""
+            seg_text = ""        # raw text this pass produced (for the next prompt)
             errored = False
+
+            # Seam dedup: on a continuation pass, buffer the head of the segment
+            # until we have _SEAM_WINDOW chars (or the pass ends), strip any
+            # overlap with what we already emitted, then stream the rest live.
+            is_cont = attempt > 0
+            prev_tail = full_text[-_SEAM_WINDOW:] if is_cont else ""
+            buffering = is_cont
+            head = ""
+
+            def _emit(text):
+                # helper so we both record full_text and yield the SSE token
+                nonlocal full_text
+                if not text:
+                    return None
+                full_text += text
+                return _sse({"type": "token", "text": text})
+
             try:
                 while True:
                     kind, data = next(gen)
                     if kind == "token":
                         seg_text += data
-                        full_text += data
-                        yield _sse({"type": "token", "text": data})
+                        if buffering:
+                            head += data
+                            if len(head) < _SEAM_WINDOW:
+                                continue
+                            # enough buffered — drop the seam overlap, flush rest
+                            k = _overlap_len(prev_tail, head)
+                            ev = _emit(head[k:])
+                            buffering = False
+                            head = ""
+                            if ev:
+                                yield ev
+                        else:
+                            ev = _emit(data)
+                            if ev:
+                                yield ev
                     elif kind == "error":
                         yield _sse({"type": "error", "message": data})
                         errored = True
                         break
             except StopIteration as stop:
                 result = stop.value or {"finish_reason": "stop"}
+
+            # Pass ended while still buffering (short segment): flush remainder
+            # minus the seam overlap.
+            if not errored and buffering:
+                k = _overlap_len(prev_tail, head)
+                ev = _emit(head[k:])
+                if ev:
+                    yield ev
             if errored:
                 return
 
