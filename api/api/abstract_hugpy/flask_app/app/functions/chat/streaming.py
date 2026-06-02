@@ -91,11 +91,36 @@ def chat_iter_sync(agen):
         loop.close()
 
 
+def _resolve_max_new_tokens(body: ChatBody) -> int:
+    """Default to the model's full context when the client didn't cap it.
+
+    A tool, not a service — so when max_new_tokens is omitted we give the model
+    as much room as it has. The worker auto-continues past this per-call cap, so
+    this is the per-pass budget, not a hard ceiling on total output.
+    """
+    if body.max_new_tokens:
+        return body.max_new_tokens
+    try:
+        from abstract_hugpy.imports.config.main import get_model_config
+        cfg = get_model_config(body.model_key) if body.model_key else None
+        ctx = getattr(cfg, "model_max_length", None)
+        if ctx and int(ctx) > 0:
+            return int(ctx)
+    except Exception:
+        pass
+    # Fall back to the global default cap.
+    try:
+        from abstract_hugpy.imports.src.constants.constants import DEFAULT_MAX_TOKENS
+        return int(DEFAULT_MAX_TOKENS)
+    except Exception:
+        return 4096
+
+
 async def stream_events(body: ChatBody):
     from abstract_hugpy.managers.dispatch import execute_prompt
 
     prompt_kwargs = {
-        "max_new_tokens": body.max_new_tokens,
+        "max_new_tokens": _resolve_max_new_tokens(body),
     }
 
 

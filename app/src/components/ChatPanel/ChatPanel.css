@@ -233,3 +233,9 @@
   align-self: flex-start;
 }
 .msg-file, .attach-file { font-size: 12px; color: var(--muted); }
+.msg-status {
+  font-size: 12px;
+  color: #d29922;
+  font-style: italic;
+  padding: 2px 0 4px;
+}

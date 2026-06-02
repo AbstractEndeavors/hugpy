@@ -6,7 +6,10 @@ class ChatBody(BaseModel):
     messages: Optional[List[dict]] = None
     file: Optional[str] = None          # server path from /api/uploads
     images: Optional[List[str]] = None  # base64, if you also do inline images
-    max_new_tokens: int = 2048
+    # None = "as many as the model allows" — resolved to the model's context at
+    # request time. The worker also auto-continues past this per-call cap, so a
+    # response is never truncated by the token budget.
+    max_new_tokens: Optional[int] = None
     temperature: Optional[float] = None
     do_sample: Optional[bool] = None
 

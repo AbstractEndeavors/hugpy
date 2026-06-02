@@ -202,6 +202,92 @@ def _ensure_present(payload: dict, central_url: str | None) -> None:
         logger.warning("provisioning check for %s failed: %s", model_key, exc)
 
 
+def _ensure_present_streaming(payload: dict, central_url: str | None):
+    """Provision the model, yielding SSE 'status' events with download progress.
+
+    Yields encoded SSE lines (status/error). Returns normally once the model is
+    present (or was already). Throttled so we don't flood the stream.
+    """
+    model_key = payload.get("model_key")
+    if not model_key:
+        return
+    try:
+        from .provision import ensure_model_present, model_is_local
+
+        if model_is_local(model_key):
+            return  # nothing to do; go straight to generation
+
+        yield _sse({"type": "status", "stage": "provision",
+                    "message": f"fetching {model_key}…", "progress": 0.0})
+
+        # provision runs in a worker thread; it pushes (done,total,fname) onto a
+        # queue that we drain into throttled SSE status events from this thread.
+        import queue
+        import threading
+
+        q: "queue.Queue" = queue.Queue()
+        result = {"ok": False, "err": None}
+
+        def _progress(done, total, fname):
+            q.put((done, total, fname))
+
+        def _run():
+            try:
+                result["ok"] = ensure_model_present(model_key, central_url, progress=_progress)
+            except Exception as exc:  # pragma: no cover
+                result["err"] = exc
+            finally:
+                q.put(None)  # sentinel: done
+
+        th = threading.Thread(target=_run, daemon=True)
+        th.start()
+
+        last_emit = 0.0
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            done, total, fname = item
+            now = time.time()
+            # Emit at most ~3x/sec, but always emit the first/last.
+            if now - last_emit < 0.33 and done < (total or 1):
+                continue
+            last_emit = now
+            frac = (done / total) if total else 0.0
+            yield _sse({
+                "type": "status", "stage": "provision",
+                "message": f"downloading {model_key} ({_human(done)}/{_human(total)})",
+                "progress": round(frac, 4),
+                "done_bytes": done, "total_bytes": total, "file": fname,
+            })
+        th.join(timeout=1.0)
+
+        if result["err"] is not None:
+            yield _sse({"type": "error",
+                        "message": f"provisioning failed: {result['err']}"})
+            return
+        if not result["ok"]:
+            yield _sse({"type": "error",
+                        "message": f"could not fetch model {model_key} from central or HF"})
+            return
+        yield _sse({"type": "status", "stage": "provision",
+                    "message": "model ready, loading…", "progress": 1.0})
+    except Exception as exc:
+        logger.warning("streaming provisioning for %s failed: %s", model_key, exc)
+
+
+def _human(n) -> str:
+    if not n:
+        return "?"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    v = float(n)
+    i = 0
+    while v >= 1024 and i < len(units) - 1:
+        v /= 1024
+        i += 1
+    return f"{v:.1f} {units[i]}"
+
+
 def _materialize_file(payload: dict) -> str | None:
     """Rebuild an inlined upload (file_b64/file_name) into a local temp file.
 
@@ -297,14 +383,21 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def _stream_sync(payload: dict):
-    """Drive dispatch.execute_prompt_stream (async gen) from Flask's sync ctx."""
+# How many continuation passes we'll chain before giving up, so a runaway
+# model can't loop forever. Each pass produces up to the per-call token cap.
+_MAX_CONTINUATIONS = int(os.environ.get("WORKER_MAX_CONTINUATIONS", "20"))
+
+
+def _run_one_pass(loop, payload: dict):
+    """Run a single execute_prompt_stream pass.
+
+    Yields ('token', text) tuples and finishes by setting the returned dict's
+    'finish_reason' + accumulated 'text'. Generator returns the result dict.
+    """
     from abstract_hugpy.managers.dispatch import execute_prompt_stream
 
-    tmp = _materialize_file(payload)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     agen = execute_prompt_stream(**payload)
+    finish = "stop"
     try:
         while True:
             try:
@@ -313,20 +406,90 @@ def _stream_sync(payload: dict):
                 break
             etype = getattr(event, "type", None)
             if etype == "token":
-                yield _sse({"type": "token", "text": getattr(event, "text", "")})
+                yield ("token", getattr(event, "text", ""))
             elif etype == "done":
-                yield _sse(
-                    {
-                        "type": "done",
-                        "finish_reason": getattr(event, "finish_reason", None) or "stop",
-                    }
-                )
-                return
+                finish = getattr(event, "finish_reason", None) or "stop"
+                break
             elif etype == "error":
-                yield _sse({"type": "error", "message": getattr(event, "message", "run failed")})
+                yield ("error", getattr(event, "message", "run failed"))
+                return {"finish_reason": "error"}
+    finally:
+        try:
+            loop.run_until_complete(agen.aclose())
+        except Exception:
+            pass
+    return {"finish_reason": finish}
+
+
+def _stream_sync(payload: dict):
+    """Drive generation from Flask's sync ctx, with auto-continuation.
+
+    When a pass stops because it hit the token cap (finish_reason == 'length' /
+    'max_tokens'), we feed what was produced back as context and continue, so a
+    response longer than any single token allowance still comes out complete.
+    Emits 'status' events between continuation segments. The browser just keeps
+    appending 'token' text, so continuation is seamless to the user.
+    """
+    tmp = _materialize_file(payload)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # finish reasons that mean "ran out of room", i.e. continue.
+    CONTINUE_ON = {"length", "max_tokens"}
+
+    # Normalize to a messages list so we can append assistant partials.
+    messages = payload.get("messages")
+    if not messages:
+        messages = [{"role": "user", "content": payload.get("prompt", "")}]
+    base_kwargs = {k: v for k, v in payload.items() if k not in ("messages", "prompt")}
+
+    try:
+        full_text = ""
+        for attempt in range(_MAX_CONTINUATIONS + 1):
+            pass_kwargs = dict(base_kwargs)
+            pass_kwargs["messages"] = messages
+            if attempt > 0:
+                yield _sse({"type": "status", "stage": "generate",
+                            "message": f"continuing (part {attempt + 1})…",
+                            "segment": attempt + 1})
+
+            gen = _run_one_pass(loop, pass_kwargs)
+            seg_text = ""
+            errored = False
+            try:
+                while True:
+                    kind, data = next(gen)
+                    if kind == "token":
+                        seg_text += data
+                        full_text += data
+                        yield _sse({"type": "token", "text": data})
+                    elif kind == "error":
+                        yield _sse({"type": "error", "message": data})
+                        errored = True
+                        break
+            except StopIteration as stop:
+                result = stop.value or {"finish_reason": "stop"}
+            if errored:
                 return
-        # Stream ended without an explicit done — synthesize one.
-        yield _sse({"type": "done", "finish_reason": "stop"})
+
+            finish = result.get("finish_reason", "stop")
+            if finish not in CONTINUE_ON:
+                yield _sse({"type": "done", "finish_reason": finish})
+                return
+            if not seg_text.strip():
+                # Hit the cap but produced nothing usable — stop to avoid a loop.
+                yield _sse({"type": "done", "finish_reason": "stop"})
+                return
+
+            # Continue: append the partial assistant turn and prompt to keep going.
+            messages = messages + [
+                {"role": "assistant", "content": seg_text},
+                {"role": "user", "content": "Continue exactly where you left off. "
+                                            "Do not repeat any previous text."},
+            ]
+
+        # Exhausted the continuation budget.
+        yield _sse({"type": "done", "finish_reason": "length"})
     finally:
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
@@ -384,9 +547,15 @@ def build_app(state: "WorkerState") -> Flask:
     def infer_stream():
         payload = request.get_json(silent=True) or {}
         _apply_spill(payload.pop("spill", None))
-        _ensure_present(payload, state.central_url)
+
+        def _generate():
+            # Stream provisioning progress first (download from central/HF), then
+            # generation with auto-continuation. Both emit SSE lines already.
+            yield from _ensure_present_streaming(payload, state.central_url)
+            yield from _stream_sync(payload)
+
         return Response(
-            stream_with_context(_stream_sync(payload)),
+            stream_with_context(_generate()),
             mimetype="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

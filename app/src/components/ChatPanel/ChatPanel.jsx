@@ -28,7 +28,7 @@ export default function ChatPanel({ modelKey, model, onClose }) {
   const [messages, setMessages]     = useState([])
   const [input, setInput]           = useState('')
   const [system, setSystem]         = useState('')
-  const [maxTokens, setMaxTokens]   = useState(2048)
+  const [maxTokens, setMaxTokens]   = useState(null)   // null = model max (auto-continued)
   const [streaming, setStreaming]   = useState(false)
   const [attachment, setAttachment] = useState(null)   // {name, isImage, dataUrl?, path?, uploading?}
   const bottomRef = useRef(null)
@@ -88,8 +88,11 @@ export default function ChatPanel({ modelKey, model, onClose }) {
     const payload = {
       model_key: modelKey,
       prompt: text,
-      max_new_tokens: maxTokens,
     }
+    // Omit max_new_tokens entirely unless the user set one via /tokens — the
+    // backend then defaults to the model's full context and auto-continues
+    // past it, so responses are never truncated.
+    if (maxTokens) payload.max_new_tokens = maxTokens
     if (att?.path) payload.file = att.path
     const modelName = model?.name ?? modelKey
     setMessages(prev => [...prev, { role: 'assistant', content: '', model: modelName }])
@@ -117,11 +120,21 @@ export default function ChatPanel({ modelKey, model, onClose }) {
           if (!raw || raw === '[DONE]') continue
           try {
             const evt = JSON.parse(raw)
-            if (evt.type === 'token') {
+            if (evt.type === 'status') {
+              // Provisioning / continuation progress — show transiently on the
+              // assistant bubble; cleared as soon as real tokens arrive.
+              const pct = evt.progress != null ? ` ${Math.round(evt.progress * 100)}%` : ''
               setMessages(prev => {
                 const copy = [...prev]
                 const last = copy[copy.length - 1]
-                if (last?.role === 'assistant') copy[copy.length - 1] = { ...last, content: last.content + evt.text }
+                if (last?.role === 'assistant') copy[copy.length - 1] = { ...last, status: `${evt.message || evt.stage || 'working'}${pct}` }
+                return copy
+              })
+            } else if (evt.type === 'token') {
+              setMessages(prev => {
+                const copy = [...prev]
+                const last = copy[copy.length - 1]
+                if (last?.role === 'assistant') copy[copy.length - 1] = { ...last, content: last.content + evt.text, status: null }
                 return copy
               })
             } else if (evt.type === 'error') {
@@ -163,7 +176,7 @@ export default function ChatPanel({ modelKey, model, onClose }) {
           <span className="chat-meta">
             {model?.framework} · {model?.primary_task ?? model?.task}
             {system && <span className="system-set" title={system}> · sys</span>}
-            {' · '}max {maxTokens} tok
+            {' · '}{maxTokens ? `max ${maxTokens} tok` : 'unbounded (auto-continue)'}
             {vlCapable && <span className="vl-tag" title="vision-language model"> · 🖼 VL</span>}
           </span>
         </div>
@@ -191,6 +204,9 @@ export default function ChatPanel({ modelKey, model, onClose }) {
             )}
             {msg.attachment && !msg.attachment.isImage && (
               <span className="msg-file" title={msg.attachment.name}>📎 {msg.attachment.name}</span>
+            )}
+            {msg.status && !msg.content && (
+              <div className="msg-status">⏳ {msg.status}</div>
             )}
             <pre className="msg-content">{msg.content}
               {msg.role === 'assistant' && streaming && i === messages.length - 1 && <span className="cursor">▌</span>}

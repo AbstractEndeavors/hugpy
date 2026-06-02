@@ -61,18 +61,27 @@ def _get_json(url: str, timeout: float = 30.0) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _download_file(url: str, dest_path: str, expected_size: int | None) -> None:
-    """Stream one file to dest_path, resuming if a partial is already present."""
+def _download_file(url: str, dest_path: str, expected_size: int | None,
+                   on_bytes=None) -> None:
+    """Stream one file to dest_path, resuming if a partial is already present.
+
+    ``on_bytes(n)`` is called with the number of newly-written bytes per chunk
+    so the caller can report download progress.
+    """
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
 
     have = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
     if expected_size is not None and have == expected_size:
+        if on_bytes:
+            on_bytes(have)   # count the already-present bytes toward progress
         return  # already complete
 
     req = urllib.request.Request(url)
     if have and expected_size and have < expected_size:
         req.add_header("Range", f"bytes={have}-")
         mode = "ab"
+        if on_bytes:
+            on_bytes(have)   # resumed: pre-existing bytes already on disk
     else:
         have = 0
         mode = "wb"
@@ -83,11 +92,14 @@ def _download_file(url: str, dest_path: str, expected_size: int | None) -> None:
             if not chunk:
                 break
             fh.write(chunk)
+            if on_bytes:
+                on_bytes(len(chunk))
 
 
-def fetch_from_central(central_url: str, model_key: str) -> bool:
+def fetch_from_central(central_url: str, model_key: str, progress=None) -> bool:
     """Pull a model's files from central into the worker's storage.
 
+    ``progress(done_bytes, total_bytes, filename)`` is called as bytes arrive.
     Returns True on success, False if central doesn't have the model (so the
     caller can fall back to Hugging Face). Raises on hard network errors only
     when central was reachable but failed mid-transfer.
@@ -106,17 +118,44 @@ def fetch_from_central(central_url: str, model_key: str) -> bool:
 
     dest = _local_destination(manifest)
     files = manifest.get("files") or []
-    logger.info("provisioning %s from central: %d files -> %s", model_key, len(files), dest)
+    total = manifest.get("total_bytes") or sum((e.get("size") or 0) for e in files)
+    logger.info("provisioning %s from central: %d files (%s) -> %s",
+                model_key, len(files), _human(total), dest)
 
+    done = 0
+
+    def _emit(fname):
+        if progress:
+            progress(done, total, fname)
+
+    _emit("")
     for entry in files:
         rel = entry["path"]
         size = entry.get("size")
         url = base + "/file?path=" + urllib.parse.quote(rel)
         target = os.path.join(dest, rel)
-        _download_file(url, target, size)
+
+        def _on_bytes(n, _rel=rel):
+            nonlocal done
+            done += n
+            _emit(_rel)
+
+        _download_file(url, target, size, on_bytes=_on_bytes)
 
     logger.info("provisioned %s from central", model_key)
     return True
+
+
+def _human(n) -> str:
+    if not n:
+        return "?"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    v = float(n)
+    i = 0
+    while v >= 1024 and i < len(units) - 1:
+        v /= 1024
+        i += 1
+    return f"{v:.1f} {units[i]}"
 
 
 def fetch_from_hf(model_key: str) -> str:
@@ -127,25 +166,29 @@ def fetch_from_hf(model_key: str) -> str:
     return ensure_model(model_key)
 
 
-def ensure_model_present(model_key: str, central_url: str | None) -> bool:
+def ensure_model_present(model_key: str, central_url: str | None, progress=None) -> bool:
     """Make sure model_key is on local disk. Central-first, then HF fallback.
 
-    Returns True if the model is present (or already was), False if it could
-    not be provisioned by any route.
+    ``progress(done_bytes, total_bytes, filename)`` is forwarded to the central
+    download so callers can stream provisioning status. Returns True if the
+    model is present (or already was), False if it could not be provisioned.
     """
     if model_is_local(model_key):
         return True
 
     if central_url:
         try:
-            if fetch_from_central(central_url, model_key):
+            if fetch_from_central(central_url, model_key, progress=progress):
                 return True
         except Exception as exc:
             logger.warning("central provisioning of %s failed: %s; trying HF", model_key, exc)
 
     try:
+        if progress:
+            progress(0, 0, "huggingface")
         fetch_from_hf(model_key)
         return True
     except Exception as exc:
         logger.error("could not provision %s from HF: %s", model_key, exc)
         return False
+
