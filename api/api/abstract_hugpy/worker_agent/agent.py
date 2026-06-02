@@ -432,6 +432,13 @@ def _run_one_pass(loop, payload: dict):
             elif etype == "error":
                 yield ("error", getattr(event, "message", "run failed"))
                 return {"finish_reason": "error"}
+    except Exception as exc:
+        # The runner raised instead of emitting an error event (e.g. a model
+        # that needs infra this worker doesn't have). Convert to a clean error
+        # event so the user sees a message, not a crashed stream / traceback.
+        logger.warning("generation failed: %s: %s", type(exc).__name__, exc)
+        yield ("error", f"{type(exc).__name__}: {exc}")
+        return {"finish_reason": "error"}
     finally:
         try:
             loop.run_until_complete(agen.aclose())
@@ -547,6 +554,11 @@ def _stream_sync(payload: dict):
 
         # Exhausted the continuation budget.
         yield _sse({"type": "done", "finish_reason": "length"})
+    except Exception as exc:
+        # Last-resort guard: never let an exception escape into the WSGI layer
+        # (that aborts the stream with a raw traceback). Emit a clean error.
+        logger.warning("stream failed: %s: %s", type(exc).__name__, exc)
+        yield _sse({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
     finally:
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
