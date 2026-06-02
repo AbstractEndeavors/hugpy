@@ -22,6 +22,63 @@ from .imports import *
 from .categories import *
 from .assure_model_key import assure_model_key
 # ---------------------------------------------------------------------------
+# Peer placement (System A) — placement.json delegation.
+#
+# resolve() calls peer_for() on EVERY request, so these must always be defined,
+# even when no placement file exists. A missing/empty placement.json means
+# "everything runs locally" — peer_for() returns None and resolve() falls
+# through to the local runner. (This block was historically edited only on the
+# deployed server and never committed, so the repo's resolve() raised NameError
+# on peer_for for every request — which looked like 'no compute allocated'.)
+# ---------------------------------------------------------------------------
+try:
+    PLACEMENT_PATH
+except NameError:
+    PLACEMENT_PATH = os.path.join(PROJECTS_HOME, "placement.json")
+
+
+class Peer(BaseModel):
+    name: str
+    base_url: str              # http://192.168.1.x:PORT — the peer's flask app
+    role: str = "compute"
+    status: str = "unknown"    # filled by a health ping
+
+
+# Placement registry: "model_key::task" -> worker name | "local" | absent.
+# Empty default = everything runs locally. _load_placement() populates these.
+_placement: Dict[str, str] = {}
+_peers: Dict[str, Peer] = {}
+
+
+def _load_placement(path: Optional[str] = None) -> None:
+    """Populate _placement/_peers from placement.json. Explicit call, not
+    import-time magic — so a missing/empty file means 'all local', never a
+    crash."""
+    global _placement, _peers
+    data = safe_load_from_json(path or PLACEMENT_PATH) or {}
+    _placement = data.get("placement", {}) or {}
+    _peers = {name: Peer(**cfg) for name, cfg in (data.get("peers", {}) or {}).items()}
+
+
+def peer_for(model_key: str, task: str) -> Optional[Peer]:
+    """Return the Peer that should serve (model_key, task), or None for local.
+
+    Looks up "model_key::task" in the placement map; "local"/absent -> None.
+    """
+    name = _placement.get(f"{model_key}::{task}")
+    if name in (None, "local"):
+        return None
+    return _peers.get(name)
+
+
+# Load once at import; safe no-op when placement.json is absent.
+try:
+    _load_placement()
+except Exception as exc:  # never let placement config break resolution
+    logger.warning("placement.json load failed (%s); all models run local", exc)
+
+
+# ---------------------------------------------------------------------------
 # resolve_model_key — picks the model. Default-resolution chain only.
 # Does NOT pick task; that's resolve()'s job.
 # ---------------------------------------------------------------------------
