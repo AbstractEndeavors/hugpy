@@ -45,7 +45,34 @@ PATHS = [
     TORCH_HOME,
     PIP_CACHE_DIR,
 ]
-[os.makedirs(path, exist_ok=True) for path in PATHS]
+
+
+def _ensure_dirs(paths):
+    """Best-effort create the storage dirs.
+
+    Importing abstract_hugpy must never hard-crash just because a storage path
+    can't be made — e.g. on a worker box where DEFAULT_ROOT (/mnt/llm_storage)
+    is a broken/stale mount (OSError errno 5) or simply not present. Each dir is
+    created independently; failures are warned about, not fatal. Set
+    DEFAULT_ROOT to a local, writable path on such boxes.
+    """
+    import logging
+    failed = []
+    for path in paths:
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as exc:
+            failed.append((path, exc))
+    if failed:
+        logging.getLogger("abstract_hugpy").warning(
+            "could not create %d storage dir(s); continuing. "
+            "Set DEFAULT_ROOT to a writable path to silence this. Details: %s",
+            len(failed),
+            "; ".join(f"{p} ({e.__class__.__name__}: {e})" for p, e in failed),
+        )
+
+
+_ensure_dirs(PATHS)
 
 os.environ.setdefault("HF_HOME", HF_HOME)
 os.environ.setdefault("HF_HUB_CACHE", HF_HUB_CACHE)
