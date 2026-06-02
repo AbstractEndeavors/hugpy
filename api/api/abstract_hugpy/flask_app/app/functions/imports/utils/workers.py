@@ -58,6 +58,25 @@ def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
     return {**worker, "status": "online" if _is_online(worker) else "offline"}
 
 
+def _match_keys(model_key: str) -> set:
+    """Normalized aliases a model might be named by, for tolerant matching.
+
+    A model can be referenced as its registry key, its hub_id (owner/name), or
+    just the trailing name — and with different case. We compare on the set of
+    these forms so an assignment made via one spelling still routes a chat that
+    uses another. Example: "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF",
+    "Qwen2.5-Coder-3B-Instruct-GGUF" and the lowercased variants all match.
+    """
+    if not model_key:
+        return set()
+    raw = str(model_key).strip()
+    forms = {raw, raw.lower()}
+    tail = raw.split("/")[-1]
+    forms.add(tail)
+    forms.add(tail.lower())
+    return forms
+
+
 class WorkerStore:
     """Disk-authoritative, multi-process-safe registry of GPU workers.
 
@@ -309,9 +328,14 @@ class WorkerStore:
         return [_public_view(w) for w in self._load().values()]
 
     def workers_for_model(self, model_key: str, *, online_only: bool = True) -> List[Dict[str, Any]]:
+        wanted = _match_keys(model_key)
         out = []
         for w in self.all():
-            if model_key not in w.get("models", []):
+            assigned = w.get("models", [])
+            # Match on the raw key OR any normalized alias (hub_id vs key vs
+            # case), so an assignment made via one form still routes a chat that
+            # names the model a slightly different way.
+            if not (model_key in assigned or wanted & {a for m in assigned for a in _match_keys(m)}):
                 continue
             if online_only and w["status"] != "online":
                 continue

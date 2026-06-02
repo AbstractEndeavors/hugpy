@@ -156,10 +156,28 @@ async def stream_events(body: ChatBody):
     worker = None
     if offloadable:
         try:
-            from ..imports.utils.workers import pick_worker_for_model
+            from ..imports.utils.workers import pick_worker_for_model, list_workers
             worker = pick_worker_for_model(body.model_key)
-        except Exception:
+            if worker:
+                logger.info("offload: picked worker %s (%s) status=%s for model=%s",
+                            worker.get("name"), worker.get("url"),
+                            worker.get("status"), body.model_key)
+            else:
+                # Say WHY no worker was picked — the usual cause of "runs local".
+                try:
+                    pool = list_workers()
+                except Exception:
+                    pool = []
+                summary = [
+                    {"name": w.get("name"), "status": w.get("status"),
+                     "models": w.get("models")} for w in pool
+                ]
+                logger.info("offload: no worker for model=%s; pool=%s", body.model_key, summary)
+        except Exception as exc:
+            logger.warning("offload: pick_worker_for_model failed: %s", exc)
             worker = None
+    else:
+        logger.info("offload: skipped (no model_key on request)")
 
     if worker:
         # Attach this worker's per-assignment spill override (if any) so the
