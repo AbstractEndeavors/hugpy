@@ -326,3 +326,40 @@
 }
 .mt-detail-raw { margin-top: 12px; }
 .mt-detail-raw summary { cursor: pointer; font-size: 0.8rem; opacity: 0.7; }
+/* per-row "run on worker" submenu */
+.mt-worker-sub {
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  padding-top: 4px;
+}
+.mt-worker-sub-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  padding: 4px 10px 2px;
+}
+.mt-worker-none { font-size: 11px; color: var(--muted); padding: 2px 10px 6px; }
+.mt-worker-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+}
+.mt-worker-row > button {
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 6px;
+  cursor: pointer;
+  text-align: left;
+}
+.mt-worker-row > button:hover:not(:disabled) { background: rgba(255,255,255,0.06); }
+.mt-worker-row > button:first-child { flex: 1; display: flex; justify-content: space-between; gap: 8px; }
+.mt-worker-on { color: var(--green); }
+.mt-worker-vram { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.mt-worker-probe { color: var(--cyan); white-space: nowrap; }
+.mt-worker-probe-detail { font-size: 10px; color: var(--muted); white-space: nowrap; padding-right: 4px; }

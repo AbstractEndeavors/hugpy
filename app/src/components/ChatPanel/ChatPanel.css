@@ -239,3 +239,14 @@
   font-style: italic;
   padding: 2px 0 4px;
 }
+
+.btn-stop {
+  padding: 8px 14px;
+  background: var(--red, #f87171);
+  color: #0f1117;
+  border-color: var(--red, #f87171);
+  font-weight: 700;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.btn-stop:hover { background: #ff9a9a; border-color: #ff9a9a; }

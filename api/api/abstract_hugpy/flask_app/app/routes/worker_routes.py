@@ -209,6 +209,53 @@ def workers_unassign(worker_id):
     return jsonify(worker)
 
 
+@worker_bp.route("/llm/chat/cancel/<request_id>", methods=["POST"])
+def chat_cancel(request_id):
+    """Cancel an in-flight chat by relaying to whichever worker is running it.
+
+    The browser knows the request_id (echoed in the SSE 'request' event). We
+    don't track which worker owns it, so we fan the cancel out to every online
+    worker; the one running it stops, the rest 404 harmlessly.
+    """
+    import httpx
+
+    cancelled = False
+    for w in list_workers():
+        if w.get("status") != "online":
+            continue
+        url = (w.get("url") or "").rstrip("/") + f"/infer/cancel/{request_id}"
+        try:
+            r = httpx.post(url, timeout=4.0)
+            if r.status_code == 200:
+                cancelled = True
+        except Exception:
+            continue
+    return jsonify({"cancelled": cancelled, "request_id": request_id})
+
+
+@worker_bp.route("/llm/workers/<worker_id>/probe", methods=["POST"])
+def workers_probe(worker_id):
+    """Live VRAM-fit probe: ask the worker to load the model and report fit.
+
+    Body: {"model_key": ...}. Relays to the worker's /probe, which loads the
+    model on its GPU and returns {fit, vram_free_before/after, vram_used}.
+    """
+    import httpx
+
+    body = AssignRequest(**(request.get_json(silent=True) or {}))
+    worker = get_worker(worker_id)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+    url = (worker.get("url") or "").rstrip("/") + "/probe/" + body.model_key
+    try:
+        # Loading can be slow (download + load), so allow generous time.
+        r = httpx.post(url, timeout=900.0)
+        return jsonify(r.json())
+    except Exception as exc:
+        return jsonify({"ok": False, "fit": False,
+                        "error": f"{type(exc).__name__}: {exc}"})
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Model provisioning — workers pull missing model files from central.
 #

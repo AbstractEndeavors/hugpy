@@ -15,6 +15,7 @@ export function Console() {
   const [activeChat, setActiveChat] = useState(null)
   const [filterTask, setFilterTask] = useState('')
   const [jobs, setJobs]             = useState({})     // id -> job (backend Job.to_dict shape)
+  const [workers, setWorkers]       = useState([])     // for the model-list "run on worker" submenu
 
   const refreshModels = useCallback(() => {
     fetchJson('/api/models')
@@ -22,7 +23,40 @@ export function Console() {
       .catch(e => { setError(e.message); setLoading(false) })
   }, [])
 
+  const refreshWorkers = useCallback(() => {
+    fetchJson('/api/llm/workers')
+      .then(data => setWorkers(Array.isArray(data) ? data : []))
+      .catch(() => {})
+  }, [])
+
   useEffect(() => { refreshModels() }, [refreshModels])
+  useEffect(() => {
+    refreshWorkers()
+    const t = setInterval(refreshWorkers, 10_000)
+    return () => clearInterval(t)
+  }, [refreshWorkers])
+
+  // Assign a model to a worker from the model list (one-click).
+  const assignWorker = useCallback((worker, modelKey) => {
+    fetchJson(`/api/llm/workers/${encodeURIComponent(worker.id)}/assign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model_key: modelKey }),
+    }).then(refreshWorkers).catch(e => alert(`Assign failed: ${e.message}`))
+  }, [refreshWorkers])
+
+  // Live VRAM-fit probe: load the model on the worker's GPU, report fit.
+  const probeWorker = useCallback(async (worker, modelKey) => {
+    try {
+      return await fetchJson(`/api/llm/workers/${encodeURIComponent(worker.id)}/probe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model_key: modelKey }),
+      })
+    } catch (e) {
+      return { ok: false, fit: false, error: e.message }
+    }
+  }, [])
 
   // poll any active job; backend Job uses `id` + status completed/failed/cancelled
   useEffect(() => {
@@ -137,6 +171,9 @@ export function Console() {
               onChat={handleChat}
               onDelete={handleDelete}
               onCancel={cancelJob}
+              workers={workers}
+              onAssignWorker={assignWorker}
+              onProbeWorker={probeWorker}
             />
           )}
         </section>

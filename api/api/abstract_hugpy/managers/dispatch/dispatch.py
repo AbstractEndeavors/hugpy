@@ -149,12 +149,17 @@ def execute_prompt(*args: Any, **kwargs: Any):
     return runner.run(req=req)
 
 
-async def execute_prompt_stream(*args, **kwargs):
+async def execute_prompt_stream(*args, cancel_event=None, **kwargs):
     """Same resolve→builder→runner path as execute_prompt, but yields events.
 
     Runners that implement a real async-generator `stream` get streamed
     through. Everyone else is run once and emitted as a single token + done.
-    The caller never has to know which kind it got."""
+    The caller never has to know which kind it got.
+
+    ``cancel_event`` (an asyncio.Event) is forwarded to runners that accept it
+    (llama.cpp, summarizer, DeepCoder), so a caller can stop generation
+    mid-stream. Runners whose stream() doesn't take cancel_event are called
+    without it — graceful degradation, no crash."""
     prompt_kwargs = normalize_prompt_kwargs(*args, **kwargs)
     res = resolve(prompt_kwargs)
     req = res.builder(prompt_kwargs, res.model_key)
@@ -162,7 +167,13 @@ async def execute_prompt_stream(*args, **kwargs):
 
     stream = getattr(runner, "stream", None)
     if stream is not None:
-        produced = stream(req)
+        # Pass cancel_event only if the runner's stream() accepts it.
+        try:
+            import inspect as _inspect
+            accepts_cancel = "cancel_event" in _inspect.signature(stream).parameters
+        except (TypeError, ValueError):
+            accepts_cancel = False
+        produced = stream(req, cancel_event=cancel_event) if (accepts_cancel and cancel_event is not None) else stream(req)
         if hasattr(produced, "__aiter__"):          # real streamer
             async for event in produced:
                 yield event

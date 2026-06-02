@@ -37,6 +37,7 @@ import os
 import sys
 import json
 import time
+import uuid
 import socket
 import logging
 import argparse
@@ -49,6 +50,10 @@ import urllib.error
 from flask import Flask, request, jsonify, Response, stream_with_context
 
 logger = logging.getLogger("abstract_hugpy.worker_agent")
+
+# request_id -> asyncio.Event, so POST /infer/cancel can stop an in-flight
+# stream mid-generation. Populated by _stream_sync, tripped by the cancel route.
+_CANCELS: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -407,15 +412,16 @@ def _overlap_len(prev_tail: str, seg: str) -> int:
     return 0
 
 
-def _run_one_pass(loop, payload: dict):
+def _run_one_pass(loop, payload: dict, cancel_event=None):
     """Run a single execute_prompt_stream pass.
 
     Yields ('token', text) tuples and finishes by setting the returned dict's
     'finish_reason' + accumulated 'text'. Generator returns the result dict.
+    ``cancel_event`` lets the request be stopped mid-stream.
     """
     from abstract_hugpy.managers.dispatch import execute_prompt_stream
 
-    agen = execute_prompt_stream(**payload)
+    agen = execute_prompt_stream(cancel_event=cancel_event, **payload)
     finish = "stop"
     try:
         while True:
@@ -447,7 +453,7 @@ def _run_one_pass(loop, payload: dict):
     return {"finish_reason": finish}
 
 
-def _stream_sync(payload: dict):
+def _stream_sync(payload: dict, request_id: str | None = None):
     """Drive generation from Flask's sync ctx, with auto-continuation.
 
     When a pass stops because it hit the token cap (finish_reason == 'length' /
@@ -455,10 +461,18 @@ def _stream_sync(payload: dict):
     response longer than any single token allowance still comes out complete.
     Emits 'status' events between continuation segments. The browser just keeps
     appending 'token' text, so continuation is seamless to the user.
+
+    ``request_id`` registers an asyncio cancel Event so POST /infer/cancel can
+    stop this stream mid-generation.
     """
     tmp = _materialize_file(payload)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # Register a cancel Event for this request so /infer/cancel can trip it.
+    cancel_event = asyncio.Event()
+    if request_id:
+        _CANCELS[request_id] = cancel_event
 
     # finish reasons that mean "ran out of room", i.e. continue.
     CONTINUE_ON = {"length", "max_tokens"}
@@ -472,6 +486,9 @@ def _stream_sync(payload: dict):
     try:
         full_text = ""
         for attempt in range(_MAX_CONTINUATIONS + 1):
+            if cancel_event.is_set():
+                yield _sse({"type": "done", "finish_reason": "cancelled"})
+                return
             pass_kwargs = dict(base_kwargs)
             pass_kwargs["messages"] = messages
             if attempt > 0:
@@ -479,7 +496,7 @@ def _stream_sync(payload: dict):
                             "message": f"continuing (part {attempt + 1})…",
                             "segment": attempt + 1})
 
-            gen = _run_one_pass(loop, pass_kwargs)
+            gen = _run_one_pass(loop, pass_kwargs, cancel_event=cancel_event)
             seg_text = ""        # raw text this pass produced (for the next prompt)
             errored = False
 
@@ -560,6 +577,8 @@ def _stream_sync(payload: dict):
         logger.warning("stream failed: %s: %s", type(exc).__name__, exc)
         yield _sse({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
     finally:
+        if request_id:
+            _CANCELS.pop(request_id, None)
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         except Exception:
@@ -618,12 +637,16 @@ def build_app(state: "WorkerState") -> Flask:
     def infer_stream():
         payload = request.get_json(silent=True) or {}
         _apply_spill(payload.pop("spill", None))
+        # Caller-supplied id for cancellation; else generate one. Echo it back
+        # as the first SSE event so the client can cancel this exact request.
+        req_id = str(payload.pop("request_id", "") or uuid.uuid4().hex)
 
         def _generate():
+            yield _sse({"type": "request", "request_id": req_id})
             # Stream provisioning progress first (download from central/HF), then
             # generation with auto-continuation. Both emit SSE lines already.
             yield from _ensure_present_streaming(payload, state.central_url)
-            yield from _stream_sync(payload)
+            yield from _stream_sync(payload, request_id=req_id)
 
         return Response(
             stream_with_context(_generate()),
@@ -636,7 +659,62 @@ def build_app(state: "WorkerState") -> Flask:
             direct_passthrough=True,
         )
 
+    @app.route("/infer/cancel/<request_id>", methods=["POST"])
+    def infer_cancel(request_id):
+        ev = _CANCELS.get(request_id)
+        if ev is None:
+            return jsonify({"cancelled": False, "reason": "unknown or finished request"}), 404
+        ev.set()
+        return jsonify({"cancelled": True, "request_id": request_id})
+
+    @app.route("/probe/<path:model_key>", methods=["POST", "GET"])
+    def probe(model_key):
+        # Live VRAM-fit check: actually load the model on this worker's GPU and
+        # report whether it fit, plus before/after free VRAM. Loading is cached
+        # by dispatch, so a probe also warms the model for the first real chat.
+        return jsonify(_probe_model(model_key, state))
+
     return app
+
+
+def _free_vram_bytes() -> int | None:
+    try:
+        from abstract_hugpy.managers.spill import free_vram_bytes
+        return free_vram_bytes()
+    except Exception:
+        return None
+
+
+def _probe_model(model_key: str, state: "WorkerState") -> dict:
+    """Load the model on the GPU and report fit + VRAM deltas.
+
+    Returns {ok, fit, vram_free_before, vram_free_after, vram_used, error}.
+    'fit' is a heuristic: ok load AND GPU memory actually decreased (i.e. weights
+    landed on the GPU, not spilled entirely to CPU).
+    """
+    before = _free_vram_bytes()
+    result: dict = {"model_key": model_key, "vram_free_before": before}
+    try:
+        # Make sure the files are present (central-first), then build the runner,
+        # which loads the model. A tiny run confirms it can actually generate.
+        from .provision import ensure_model_present
+        ensure_model_present(model_key, state.central_url)
+
+        from abstract_hugpy.managers.dispatch import runner_for
+        runner_for(model_key=model_key)  # builds + caches the runner (loads weights)
+
+        after = _free_vram_bytes()
+        used = (before - after) if (before is not None and after is not None) else None
+        result.update(
+            ok=True,
+            vram_free_after=after,
+            vram_used=used,
+            # If GPU free memory dropped meaningfully, weights are on the GPU.
+            fit=bool(used and used > 64 * 1024 * 1024),
+        )
+    except Exception as exc:
+        result.update(ok=False, fit=False, error=f"{type(exc).__name__}: {exc}")
+    return result
 
 
 # ---------------------------------------------------------------------------

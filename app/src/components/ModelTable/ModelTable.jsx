@@ -120,8 +120,12 @@ export default function ModelTable({
   onChat,
   onDelete,
   onCancel,
+  workers = [],
+  onAssignWorker,
+  onProbeWorker,
 }) {
   const [openKey, setOpenKey] = useState(null)
+  const [probe, setProbe] = useState({})   // `${workerId}:${modelKey}` -> 'probing'|result
 
   const [query, setQuery] = useState('')
   const [frameworkFilter, setFrameworkFilter] = useState('')
@@ -425,6 +429,60 @@ function ModelDetail({ model, colSpan }) {
                             >
                               ✕ Cancel download
                             </button>
+                          )}
+
+                          {workers.length > 0 && (
+                            <div className="mt-worker-sub">
+                              <div className="mt-worker-sub-label">🖧 Run on worker</div>
+                              {workers.filter(w => w.status === 'online').length === 0 && (
+                                <div className="mt-worker-none">no online workers</div>
+                              )}
+                              {workers.filter(w => w.status === 'online').map(w => {
+                                const serving = (w.models || []).includes(modelKey)
+                                const free = w.gpus?.[0]?.memory_free
+                                const need = m.total_bytes
+                                // Quick static hint: red if we have both numbers and it won't fit.
+                                const tight = (free != null && need != null && need > free)
+                                const pk = `${w.id}:${modelKey}`
+                                const pr = probe[pk]
+                                return (
+                                  <div key={w.id} className="mt-worker-row">
+                                    <button
+                                      role="menuitem"
+                                      className={serving ? 'mt-worker-on' : ''}
+                                      title={serving ? 'Already assigned — click to keep' : 'Assign this model to this worker'}
+                                      onClick={() => { onAssignWorker?.(w, modelKey) }}
+                                    >
+                                      {serving ? '✓ ' : '+ '}{w.name}
+                                      <span className="mt-worker-vram">
+                                        {free != null ? `${fmtBytes(free)} free` : 'GPU ?'}
+                                        {tight && ' ⚠'}
+                                      </span>
+                                    </button>
+                                    <button
+                                      role="menuitem"
+                                      className="mt-worker-probe"
+                                      title="Load the model on this GPU and report whether it fits"
+                                      disabled={pr === 'probing'}
+                                      onClick={async () => {
+                                        setProbe(p => ({ ...p, [pk]: 'probing' }))
+                                        const res = await onProbeWorker?.(w, modelKey)
+                                        setProbe(p => ({ ...p, [pk]: res || { ok: false } }))
+                                      }}
+                                    >
+                                      {pr === 'probing' ? '…'
+                                        : pr ? (pr.fit ? '✓ fits' : (pr.ok ? '◐ spills' : '✗'))
+                                        : 'probe'}
+                                    </button>
+                                    {pr && pr !== 'probing' && (
+                                      <span className="mt-worker-probe-detail" title={pr.error || ''}>
+                                        {pr.vram_used != null ? `used ${fmtBytes(pr.vram_used)}` : (pr.error ? 'error' : '')}
+                                      </span>
+                                    )}
+                                  </div>
+                                )
+                              })}
+                            </div>
                           )}
 
                           <button

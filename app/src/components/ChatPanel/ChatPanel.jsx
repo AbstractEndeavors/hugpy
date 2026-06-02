@@ -34,6 +34,8 @@ export default function ChatPanel({ modelKey, model, onClose }) {
   const bottomRef = useRef(null)
   const inputRef  = useRef(null)
   const fileRef   = useRef(null)
+  const abortRef  = useRef(null)   // AbortController for the in-flight stream
+  const reqIdRef  = useRef(null)   // request_id of the in-flight stream (for cancel)
 
   const vlCapable = isVLModel(model)
 
@@ -85,9 +87,14 @@ export default function ChatPanel({ modelKey, model, onClose }) {
         if (a?.path) base.file = a.path
         return base
       })
+    // Client-generated id so we can cancel this exact request; the server
+    // echoes it back (and may override) via the 'request' SSE event.
+    const reqId = (crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`)
+    reqIdRef.current = reqId
     const payload = {
       model_key: modelKey,
       prompt: text,
+      request_id: reqId,
     }
     // Omit max_new_tokens entirely unless the user set one via /tokens — the
     // backend then defaults to the model's full context and auto-continues
@@ -97,11 +104,14 @@ export default function ChatPanel({ modelKey, model, onClose }) {
     const modelName = model?.name ?? modelKey
     setMessages(prev => [...prev, { role: 'assistant', content: '', model: modelName }])
 
+    const ctrl = new AbortController()
+    abortRef.current = ctrl
     try {
       const resp = await fetch('/api/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
+        signal: ctrl.signal,
       })
       if (!resp.ok) throw new Error(`${resp.status}: ${await resp.text()}`)
 
@@ -120,7 +130,10 @@ export default function ChatPanel({ modelKey, model, onClose }) {
           if (!raw || raw === '[DONE]') continue
           try {
             const evt = JSON.parse(raw)
-            if (evt.type === 'status') {
+            if (evt.type === 'request') {
+              // Server's authoritative request_id for cancellation.
+              if (evt.request_id) reqIdRef.current = evt.request_id
+            } else if (evt.type === 'status') {
               // Provisioning / continuation progress — show transiently on the
               // assistant bubble; cleared as soon as real tokens arrive.
               const pct = evt.progress != null ? ` ${Math.round(evt.progress * 100)}%` : ''
@@ -149,20 +162,44 @@ export default function ChatPanel({ modelKey, model, onClose }) {
         }
       }
     } catch (e) {
-      setMessages(prev => {
-        const copy = [...prev]
-        const last = copy[copy.length - 1]
-        if (last?.role === 'assistant' && last.content === '') {
-          copy[copy.length - 1] = { role: 'assistant', content: `[Error: ${e.message}]`, error: true }
-        } else {
-          copy.push({ role: 'assistant', content: `[Error: ${e.message}]`, error: true })
-        }
-        return copy
-      })
+      if (e.name === 'AbortError') {
+        // User stopped it — mark the partial as stopped, not an error.
+        setMessages(prev => {
+          const copy = [...prev]
+          const last = copy[copy.length - 1]
+          if (last?.role === 'assistant') {
+            copy[copy.length - 1] = { ...last, status: null, content: last.content + ' ⏹', stopped: true }
+          }
+          return copy
+        })
+      } else {
+        setMessages(prev => {
+          const copy = [...prev]
+          const last = copy[copy.length - 1]
+          if (last?.role === 'assistant' && last.content === '') {
+            copy[copy.length - 1] = { role: 'assistant', content: `[Error: ${e.message}]`, error: true }
+          } else {
+            copy.push({ role: 'assistant', content: `[Error: ${e.message}]`, error: true })
+          }
+          return copy
+        })
+      }
     } finally {
       setStreaming(false)
+      abortRef.current = null
+      reqIdRef.current = null
     }
   }, [input, attachment, messages, modelKey, system, maxTokens, streaming])
+
+  // Stop the in-flight response: tell the worker to halt generation (so the GPU
+  // stops doing work), then abort the local fetch.
+  const stop = useCallback(() => {
+    const rid = reqIdRef.current
+    if (rid) {
+      fetch(`/api/llm/chat/cancel/${encodeURIComponent(rid)}`, { method: 'POST' }).catch(() => {})
+    }
+    abortRef.current?.abort()
+  }, [])
 
   const onKey = useCallback((e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
@@ -236,9 +273,15 @@ export default function ChatPanel({ modelKey, model, onClose }) {
           onChange={e => setInput(e.target.value)} onKeyDown={onKey}
           placeholder="Message… (Enter to send, Shift+Enter for newline)" disabled={streaming}
         />
-        <button className="btn-send" onClick={send} disabled={(!input.trim() && !attachment) || streaming || attachment?.uploading}>
-          {streaming ? '…' : '↑ Send'}
-        </button>
+        {streaming ? (
+          <button className="btn-stop" onClick={stop} title="Stop generating">
+            ⏹ Stop
+          </button>
+        ) : (
+          <button className="btn-send" onClick={send} disabled={(!input.trim() && !attachment) || attachment?.uploading}>
+            ↑ Send
+          </button>
+        )}
       </div>
     </aside>
   )

@@ -199,6 +199,9 @@ async def stream_events(body: ChatBody):
         # Attach this worker's per-assignment spill override (if any) so the
         # worker loads the model with the operator's chosen GPU/CPU split.
         worker_kwargs = dict(prompt_kwargs)
+        if body.request_id:
+            # Worker-only: lets the browser cancel via /infer/cancel/<id>.
+            worker_kwargs["request_id"] = body.request_id
         try:
             from ..imports.utils.workers import spill_for
             spill = spill_for(worker.get("id"), body.model_key)

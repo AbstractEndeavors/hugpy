@@ -12,6 +12,9 @@ class ChatBody(BaseModel):
     max_new_tokens: Optional[int] = None
     temperature: Optional[float] = None
     do_sample: Optional[bool] = None
+    # Client-supplied id so a chat can be cancelled mid-stream
+    # (POST /api/llm/chat/cancel/<request_id>).
+    request_id: Optional[str] = None
 
     @model_validator(mode="after")
     def _require_one_input(self):
