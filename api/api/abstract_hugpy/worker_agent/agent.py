@@ -133,6 +133,33 @@ def _safe_int(value) -> int | None:
         return None
 
 
+def _local_ip_toward(central_url: str) -> str | None:
+    """The worker's own LAN IP on the route it uses to reach central.
+
+    Opening a UDP socket toward central (no packets are actually sent on
+    connect) makes the kernel pick the source address it WOULD use — i.e. the
+    worker's real outbound IP (e.g. 192.168.1.128), not loopback/127.0.1.1.
+
+    This is what we advertise, because central can't derive it reliably: when
+    the worker reaches central via a public domain, NAT hairpinning makes the
+    source IP central sees the router's address (192.168.1.1), not the worker's.
+    """
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(central_url)
+        host = parsed.hostname or central_url
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(2.0)
+            s.connect((host, port))
+            ip = s.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            return ip
+    except OSError:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Central node client (registration + heartbeat)
 # ---------------------------------------------------------------------------
@@ -521,7 +548,16 @@ def main(argv: list[str] | None = None) -> int:
     # it to central, which derives the reachable address from the request source
     # IP — far more reliable than the worker guessing past 127.0.1.1 / NAT / odd
     # NICs. We still send the listen port so central can build host:port.
-    advertise = args.advertise  # may be None
+    advertise = args.advertise
+    if not advertise:
+        # Determine the worker's own outbound IP on the route to central. This
+        # is reliable even across NAT hairpinning, which fools central's
+        # source-IP guess (central would see the router, e.g. 192.168.1.1, not
+        # the worker's .128). Falls back to None -> central uses the source IP.
+        ip = _local_ip_toward(args.central)
+        if ip:
+            advertise = f"http://{ip}:{args.port}"
+            logger.info("advertising self as %s (local IP toward central)", advertise)
     state = WorkerState(name=args.name, url=advertise,
                         worker_id=_load_worker_id(args.id_file),
                         central_url=args.central)
