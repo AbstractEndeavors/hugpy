@@ -329,11 +329,16 @@ has_hugpy() { "$1" -c "import abstract_hugpy" >/dev/null 2>&1; }
 # 1. Find a python that can import abstract_hugpy.
 if [[ -n "$PY" ]]; then
   if ! has_hugpy "$PY"; then
-    echo "error: WORKER_PYTHON=$PY cannot import abstract_hugpy." >&2; exit 1
+    echo "error: WORKER_PYTHON=$PY cannot import abstract_hugpy. Details:" >&2
+    "$PY" -c "import abstract_hugpy" || true
+    exit 1
   fi
 else
   echo "Searching for a python with abstract_hugpy…"
   CANDIDATES=()
+  # the currently-active env first (you ran this from inside it)
+  [[ -n "${CONDA_PREFIX:-}" && -x "$CONDA_PREFIX/bin/python3" ]] && CANDIDATES+=("$CONDA_PREFIX/bin/python3")
+  [[ -n "${VIRTUAL_ENV:-}" && -x "$VIRTUAL_ENV/bin/python3" ]] && CANDIDATES+=("$VIRTUAL_ENV/bin/python3")
   # current PATH pythons
   for c in python3 python; do command -v "$c" >/dev/null 2>&1 && CANDIDATES+=("$(command -v "$c")"); done
   # conda envs
@@ -348,13 +353,35 @@ else
            /srv/*/venv/bin/python3; do
     [[ -x "$p" ]] && CANDIDATES+=("$p")
   done
-  for cand in "${CANDIDATES[@]}"; do
-    if has_hugpy "$cand"; then PY="$cand"; break; fi
+
+  # De-duplicate while preserving order.
+  declare -A SEEN=()
+  UNIQ=()
+  for c in "${CANDIDATES[@]}"; do
+    [[ -n "${SEEN[$c]:-}" ]] && continue
+    SEEN[$c]=1; UNIQ+=("$c")
   done
+
+  FIRST_ERR=""
+  for cand in "${UNIQ[@]}"; do
+    if has_hugpy "$cand"; then PY="$cand"; break; fi
+    # Capture the first real import error so we can show WHY (not just "not found").
+    if [[ -z "$FIRST_ERR" ]]; then
+      FIRST_ERR="$("$cand" -c "import abstract_hugpy" 2>&1 || true)"
+      [[ -n "$FIRST_ERR" ]] && FIRST_ERR="[$cand] $FIRST_ERR"
+    fi
+  done
+
   if [[ -z "$PY" ]]; then
-    echo "error: could not find any python with abstract_hugpy installed." >&2
-    echo "Install it in your env (pip install abstract_hugpy), or re-run with" >&2
-    echo "  WORKER_PYTHON=/path/to/python  curl -fsSL $CENTRAL/api/llm/workers/install.sh | bash" >&2
+    echo "error: no python could import abstract_hugpy." >&2
+    echo "Checked: ${UNIQ[*]:-<none>}" >&2
+    if [[ -n "$FIRST_ERR" ]]; then
+      echo "First import error was:" >&2
+      echo "$FIRST_ERR" >&2
+    fi
+    echo "If the package is installed but import fails above, that error is the" >&2
+    echo "real problem (e.g. a missing dependency). Otherwise install it, or run:" >&2
+    echo "  WORKER_PYTHON=/path/to/python curl -fsSL $CENTRAL/api/llm/workers/install.sh | bash" >&2
     exit 1
   fi
 fi
