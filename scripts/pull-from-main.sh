@@ -35,7 +35,18 @@ PREV="$ROOT/prev/$TS"
 # Never block on an interactive credential prompt — fail fast with guidance
 # instead of looping forever asking for a username/password.
 export GIT_TERMINAL_PROMPT=0
-export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}"
+
+# Use a specific (passwordless) deploy key if present, so the clone works
+# without a configured ~/.ssh/config and without an ssh-agent. Falls back to
+# the default ssh resolution when the key file isn't there.
+DEPLOY_SSH_KEY="${DEPLOY_SSH_KEY:-/home/op/.ssh/github/githubssh_nopass}"
+if [[ -z "${GIT_SSH_COMMAND:-}" ]]; then
+  if [[ -f "$DEPLOY_SSH_KEY" ]]; then
+    export GIT_SSH_COMMAND="ssh -i $DEPLOY_SSH_KEY -oBatchMode=yes -oIdentitiesOnly=yes"
+  else
+    export GIT_SSH_COMMAND="ssh -oBatchMode=yes"
+  fi
+fi
 
 if [[ ! -d "$ROOT" ]]; then
   echo "error: $ROOT does not exist" >&2
