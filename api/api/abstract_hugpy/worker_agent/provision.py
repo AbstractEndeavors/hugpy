@@ -390,6 +390,45 @@ def fetch_from_central(central_url: str, model_key: str, progress=None) -> bool:
     return True
 
 
+class _CountingReader:
+    """Wrap a byte stream, reporting bytes read as download progress.
+
+    tarfile in streaming mode pulls from this via ``read``; every pull advances
+    a byte counter that reflects the actual network transfer (not file
+    boundaries). Emits a throttled progress callback and a throttled journal log
+    so a slow-but-moving transfer is visibly distinct from a real stall.
+    """
+
+    def __init__(self, fileobj, total, model_key, on_progress=None):
+        self._f = fileobj
+        self._total = int(total or 0)
+        self._model_key = model_key
+        self._on_progress = on_progress
+        self._done = 0
+        self._last_emit = 0.0
+        self._last_log = 0.0
+
+    def read(self, size=-1):
+        chunk = self._f.read(size)
+        if chunk:
+            self._done += len(chunk)
+            now = time.time()
+            done = min(self._done, self._total) if self._total else self._done
+            if self._on_progress and now - self._last_emit > 0.5:
+                self._last_emit = now
+                try:
+                    self._on_progress(done, self._total, "archive")
+                except Exception:  # progress is best-effort; never break the read
+                    pass
+            if now - self._last_log > 5.0:
+                self._last_log = now
+                pct = (100.0 * done / self._total) if self._total else 0.0
+                logger.info("downloading %s archive: %s / %s (%.0f%%)",
+                            self._model_key, _human(self._done),
+                            _human(self._total), pct)
+        return chunk
+
+
 def fetch_archive_from_central(central_url: str, model_key: str, progress=None) -> bool:
     """Pull the model's ENTIRE directory from central as one streamed tar.
 
@@ -442,19 +481,22 @@ def fetch_archive_from_central(central_url: str, model_key: str, progress=None) 
         logger.warning("central archive unreachable for %s (%s)", model_key, exc)
         return False
 
-    extracted = 0
+    # Wrap the stream so progress reflects BYTES read off the socket — the true
+    # download rate — rather than ticking only when a whole file finishes
+    # extracting (which sat at 0% while a multi-GB file streamed). Also logs
+    # throughput to the journal so a real stall is visible vs. a slow file.
+    reader = _CountingReader(resp, total, model_key, on_progress=progress)
+
     # mode "r|" = sequential streaming read, matching central's "w|" writer.
-    with resp, tarfile.open(fileobj=resp, mode="r|") as tar:
+    with resp, tarfile.open(fileobj=reader, mode="r|") as tar:
         for member in tar:
             target = os.path.realpath(os.path.join(dest, member.name))
             if target != dest_real and not target.startswith(dest_real + os.sep):
                 raise RuntimeError(f"unsafe path in archive member: {member.name!r}")
             tar.extract(member, dest)
-            if member.isfile():
-                extracted += 1
-                if progress:
-                    progress(min(total, extracted * (total // max(len(files), 1))),
-                             total, member.name)
+
+    if progress:
+        progress(total, total, "archive")  # final 100%
 
     # Completeness gate against the manifest.
     missing = _missing_or_short(dest, files)
