@@ -95,8 +95,19 @@ def _bare_host(value):
     return value.split("/", 1)[0] or "127.0.0.1"
 
 
-def _ctx_for(cfg, model_key):
-    extra = getattr(cfg, "extra", {}) or {}
+def _effective_extra(model_key, cfg) -> dict:
+    """cfg.extra with the persisted per-model UI override merged on top."""
+    extra = dict(getattr(cfg, "extra", {}) or {})
+    try:
+        from .overrides import get_override
+        extra.update(get_override(model_key))
+    except Exception:  # overrides are optional; never break spec resolution
+        pass
+    return extra
+
+
+def _ctx_for(cfg, model_key, extra=None):
+    extra = extra if extra is not None else _effective_extra(model_key, cfg)
     if extra.get("llama_ctx"):
         return int(extra["llama_ctx"])
     mml = getattr(cfg, "model_max_length", None) or DEFAULT_LLAMA_CTX
@@ -142,10 +153,11 @@ def _resolve_port(model_key, cfg) -> int:
     return _auto_port(model_key)
 
 
-def _resolve_mode(cfg) -> ServeMode:
+def _resolve_mode(cfg, extra=None) -> ServeMode:
     if getattr(cfg, "framework", None) != "llama_cpp":
         return ServeMode.OFF
-    explicit = (getattr(cfg, "extra", {}) or {}).get("serve_mode")
+    extra = extra if extra is not None else (getattr(cfg, "extra", {}) or {})
+    explicit = extra.get("serve_mode")
     # systemd no longer falls back to off for a missing port — _resolve_port
     # auto-assigns a deterministic one.
     return ServeMode(explicit) if explicit else ServeMode(DEFAULT_SERVE_MODE)
@@ -198,8 +210,8 @@ class ServeSpec:
 def serve_spec_for(model_key=None, *, cfg=None) -> ServeSpec:
     cfg = cfg if cfg is not None else get_model_config(model_key)
     model_key = model_key or cfg.model_key or cfg.name
-    mode = _resolve_mode(cfg)
-    extra = getattr(cfg, "extra", {}) or {}
+    extra = _effective_extra(model_key, cfg)   # cfg.extra + persisted UI override
+    mode = _resolve_mode(cfg, extra)
 
     if mode is ServeMode.SWAP:
         host, port = LLAMA_SWAP_HOST, LLAMA_SWAP_PORT
@@ -215,7 +227,7 @@ def serve_spec_for(model_key=None, *, cfg=None) -> ServeSpec:
         model_file=_model_file_for(model_key, cfg),
         host=host,
         port=port,
-        ctx_size=_ctx_for(cfg, model_key),
+        ctx_size=_ctx_for(cfg, model_key, extra),
         threads=int(extra.get("threads") or DEFAULT_LLAMA_THREADS),
         n_gpu_layers=int(extra.get("n_gpu_layers", DEFAULT_LLAMA_NGL)),
         always_on=bool(extra.get("always_on", True)),
@@ -532,13 +544,22 @@ def serving_overview(registry=None):
     rows = []
     for key, spec in specs.items():
         driver = get_serve_driver(spec.mode)
-        rows.append({
-            "key": key,
-            "mode": spec.mode.value,
-            "always_on": spec.always_on,
-            "endpoint": driver.endpoint(spec),
-            "model_name": driver.model_name(spec),
-            "n_gpu_layers": spec.n_gpu_layers,
-            "ttl_seconds": spec.ttl_seconds,
-        })
+        rows.append(spec_row(spec, driver))
     return rows
+
+
+def spec_row(spec, driver=None) -> dict:
+    """One serving row for the console — the editable knobs + resolved endpoint."""
+    driver = driver or get_serve_driver(spec.mode)
+    return {
+        "key": spec.model_key,
+        "mode": spec.mode.value,
+        "always_on": spec.always_on,
+        "endpoint": driver.endpoint(spec),
+        "model_name": driver.model_name(spec),
+        "port": spec.port,
+        "n_gpu_layers": spec.n_gpu_layers,
+        "threads": spec.threads,
+        "ctx_size": spec.ctx_size,
+        "ttl_seconds": spec.ttl_seconds,
+    }

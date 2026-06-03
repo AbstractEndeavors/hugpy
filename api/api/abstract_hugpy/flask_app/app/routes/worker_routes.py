@@ -394,6 +394,80 @@ def model_archive(model_key):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Per-model serving control — what the console edits (mode + GPU/CPU/ctx).
+#
+# GET  /api/llm/serving                 overview rows for every model
+# GET  /api/llm/serving/<key>           one model's effective serving + override
+# POST /api/llm/serving/<key>           set override fields; {"apply": true} to
+#                                       also (re)write + restart the unit
+#
+# The override is persisted (serve_overrides.json) and merged into the spec, so
+# it drives the systemd unit, the swap config, and the HTTP runner endpoint.
+# Applying systemd changes needs root; when the API isn't root we return the
+# exact commands to run with sudo instead of failing.
+# ──────────────────────────────────────────────────────────────────────────
+def _apply_serving(model_key):
+    import subprocess
+    from abstract_hugpy.managers.serve.serve import install_serving, apply_plan
+
+    plan = install_serving(only=[model_key])
+    if not plan.steps:
+        return {"applied": False, "reason": "nothing to apply (mode=off)"}
+    if os.geteuid() != 0:
+        return {"applied": False, "reason": "API is not root; run with sudo",
+                "commands": plan.describe()}
+
+    def _run(argv):
+        subprocess.run(list(argv), check=True)
+        return " ".join(argv)
+
+    def _write(path, content):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        return path
+
+    apply_plan(plan, run=_run, write=_write)
+    return {"applied": True, "commands": plan.describe()}
+
+
+@worker_bp.route("/llm/serving", methods=["GET"])
+def serving_list():
+    from abstract_hugpy.managers.serve.serve import serving_overview
+    return jsonify(serving_overview())
+
+
+@worker_bp.route("/llm/serving/<model_key>", methods=["GET"])
+def serving_get(model_key):
+    from abstract_hugpy.managers.serve.serve import serve_spec_for, spec_row
+    from abstract_hugpy.managers.serve.overrides import get_override
+    row = spec_row(serve_spec_for(model_key))
+    row["override"] = get_override(model_key)
+    return jsonify(row)
+
+
+@worker_bp.route("/llm/serving/<model_key>", methods=["POST"])
+def serving_set(model_key):
+    from abstract_hugpy.managers.serve.serve import serve_spec_for, spec_row, install_serving
+    from abstract_hugpy.managers.serve.overrides import set_override, get_override
+
+    body = request.get_json(silent=True) or {}
+    do_apply = bool(body.pop("apply", False))
+    set_override(model_key, body)
+
+    row = spec_row(serve_spec_for(model_key))
+    row["override"] = get_override(model_key)
+    if do_apply:
+        row["apply"] = _apply_serving(model_key)
+    else:
+        try:
+            row["plan"] = install_serving(only=[model_key]).describe()
+        except Exception as exc:  # plan preview is best-effort
+            row["plan_error"] = f"{type(exc).__name__}: {exc}"
+    return jsonify(row)
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Central-driven worker install.
 #
 # An operator on a GPU box runs ONE command; everything else (where to find the

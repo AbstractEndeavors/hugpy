@@ -1,5 +1,6 @@
 import { useMemo, useState, useCallback, Fragment } from 'react'
 
+import ServingControl from './ServingControl'
 import './ModelTable.css'
 
 function fmtCtx(n) {
@@ -235,6 +236,11 @@ function ModelDetail({ model, colSpan }) {
     <tr className="mt-detail-row">
       <td colSpan={colSpan}>
         <div className="mt-detail">
+          <div className="mt-serve-section">
+            <div className="mt-serve-title">Serving (GPU / CPU / context)</div>
+            <ServingControl modelKey={model.key ?? model.hub_id} framework={model.framework} />
+          </div>
+
           <div className="mt-detail-grid">
             {rows.map(([label, val]) => (
               <div className="mt-detail-item" key={label}>

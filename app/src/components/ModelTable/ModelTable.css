@@ -363,3 +363,15 @@
 .mt-worker-vram { color: var(--muted); font-size: 10px; white-space: nowrap; }
 .mt-worker-probe { color: var(--cyan); white-space: nowrap; }
 .mt-worker-probe-detail { font-size: 10px; color: var(--muted); white-space: nowrap; padding-right: 4px; }
+
+/* per-model serving control (detail row) */
+.mt-serve-section { margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border, #2a2a2a); }
+.mt-serve-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 6px; }
+.mt-serve { display: flex; flex-direction: column; gap: 8px; }
+.mt-serve-na { color: var(--muted); font-size: 12px; }
+.mt-serve-fields { display: flex; flex-wrap: wrap; gap: 10px; }
+.mt-serve-field { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--muted); }
+.mt-serve-field input, .mt-serve-field select { width: 110px; }
+.mt-serve-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mt-serve-ep { font-size: 11px; color: var(--cyan); }
+.mt-serve-msg { font-size: 11px; color: var(--muted); }
