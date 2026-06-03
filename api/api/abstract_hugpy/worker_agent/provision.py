@@ -86,6 +86,25 @@ def _central_manifest(central_url: str, model_key: str) -> dict:
 _MODEL_LIST_PATHS = ("/api/models", "/api/llm/models", "/models")
 
 
+def list_central_models(central_url: str) -> list[dict]:
+    """Return central's model rows, trying each known list endpoint in turn.
+
+    Each row is a model config dict (carrying at least ``model_key``/``key`` and
+    ``hub_id``). Returns [] if none of the endpoints answer with a usable list.
+    """
+    for path in _MODEL_LIST_PATHS:
+        url = central_url.rstrip("/") + path
+        try:
+            listing = _get_json(url)
+        except Exception:
+            continue
+        if isinstance(listing, dict):
+            return [r for r in listing.values() if isinstance(r, dict)]
+        if isinstance(listing, list):
+            return [r for r in listing if isinstance(r, dict)]
+    return []
+
+
 def _fetch_central_model_row(central_url: str, model_key: str) -> dict | None:
     """Pull one model's config row from central, however possible.
 
