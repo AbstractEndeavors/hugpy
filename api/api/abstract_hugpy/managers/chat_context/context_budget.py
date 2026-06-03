@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable, Optional
 
 from .imports import DEFAULT_MAX_TOKENS
+
+# A token counter maps text -> token count. When the caller has the model's
+# real tokenizer (e.g. the in-process GGUF runner) it passes one in and the
+# budgeting below becomes exact instead of a chars/token estimate.
+TokenCounter = Callable[[str], int]
 
 
 @dataclass(frozen=True)
@@ -25,9 +30,21 @@ class ContextBudget:
         )
 
 
-def estimate_tokens(text: str, *, chars_per_token: float = 4.0) -> int:
+def estimate_tokens(
+    text: str,
+    *,
+    chars_per_token: float = 4.0,
+    token_counter: Optional[TokenCounter] = None,
+) -> int:
     if not text:
         return 0
+
+    if token_counter is not None:
+        try:
+            return max(1, int(token_counter(text)))
+        except Exception:
+            # A flaky tokenizer must never break budgeting; fall back to chars.
+            pass
 
     return max(1, int(len(text) / chars_per_token))
 
@@ -36,28 +53,19 @@ def estimate_message_tokens(
     message: dict,
     *,
     chars_per_token: float = 4.0,
+    token_counter: Optional[TokenCounter] = None,
 ) -> int:
     role = str(message.get("role", "user"))
     content = str(message.get("content", ""))
 
     return (
-        estimate_tokens(role, chars_per_token=chars_per_token)
-        + estimate_tokens(content, chars_per_token=chars_per_token)
+        estimate_tokens(role, chars_per_token=chars_per_token, token_counter=token_counter)
+        + estimate_tokens(content, chars_per_token=chars_per_token, token_counter=token_counter)
         + 8
     )
 
 
-def trim_content_to_token_budget(
-    content: str,
-    token_budget: int,
-    *,
-    chars_per_token: float = 4.0,
-) -> str:
-    max_chars = max(256, int(token_budget * chars_per_token))
-
-    if len(content) <= max_chars:
-        return content
-
+def _assemble_head_tail(content: str, max_chars: int) -> str:
     marker = "\n\n...[middle omitted to fit model context]...\n\n"
     marker_len = len(marker)
 
@@ -70,9 +78,54 @@ def trim_content_to_token_budget(
     return content[:head_chars] + marker + content[-tail_chars:]
 
 
+def trim_content_to_token_budget(
+    content: str,
+    token_budget: int,
+    *,
+    chars_per_token: float = 4.0,
+    token_counter: Optional[TokenCounter] = None,
+) -> str:
+    """Shrink ``content`` (keeping head + tail) until it fits ``token_budget``.
+
+    With a real ``token_counter`` this is exact: we estimate a character
+    budget, build a head/tail excerpt, then shrink in a short loop until the
+    counter confirms the result is under budget. Without one we fall back to
+    the chars/token heuristic (single pass).
+    """
+    if estimate_tokens(content, chars_per_token=chars_per_token,
+                        token_counter=token_counter) <= token_budget:
+        return content
+
+    max_chars = max(256, int(token_budget * chars_per_token))
+
+    if token_counter is None:
+        if len(content) <= max_chars:
+            return content
+        return _assemble_head_tail(content, max_chars)
+
+    # Token-accurate: derive a chars/token ratio from this very content so the
+    # first guess is close, then shrink until it actually fits.
+    measured = max(1, int(token_counter(content)))
+    ratio = max(1.0, len(content) / measured)
+    max_chars = max(256, int(token_budget * ratio * 0.95))
+
+    candidate = content
+    for _ in range(8):
+        if len(candidate) > max_chars:
+            candidate = _assemble_head_tail(content, max_chars)
+        if estimate_tokens(candidate, token_counter=token_counter) <= token_budget:
+            return candidate
+        max_chars = int(max_chars * 0.8)
+        if max_chars < 256:
+            break
+    return _assemble_head_tail(content, max(256, max_chars))
+
+
 def compact_messages_to_budget(
     messages: Iterable[dict],
     budget: ContextBudget,
+    *,
+    token_counter: Optional[TokenCounter] = None,
 ) -> list[dict]:
     """
     Keep system messages and the newest dialogue turns that fit.
@@ -80,6 +133,9 @@ def compact_messages_to_budget(
     Critical rule:
     Never return only system messages when a user message exists.
     If the newest user message is too large, trim it instead of dropping it.
+
+    Pass ``token_counter`` (the model's real tokenizer) to make every cost and
+    trim exact rather than a chars/token estimate.
     """
     normalized = [
         {
@@ -97,7 +153,9 @@ def compact_messages_to_budget(
         return system_messages
 
     system_cost = sum(
-        estimate_message_tokens(m, chars_per_token=budget.chars_per_token)
+        estimate_message_tokens(
+            m, chars_per_token=budget.chars_per_token, token_counter=token_counter
+        )
         for m in system_messages
     )
 
@@ -112,6 +170,7 @@ def compact_messages_to_budget(
         cost = estimate_message_tokens(
             message,
             chars_per_token=budget.chars_per_token,
+            token_counter=token_counter,
         )
 
         if used + cost > remaining:
@@ -129,6 +188,7 @@ def compact_messages_to_budget(
                             content,
                             content_budget,
                             chars_per_token=budget.chars_per_token,
+                            token_counter=token_counter,
                         ),
                     }
                 )
@@ -155,6 +215,7 @@ def compact_messages_to_budget(
                         newest_user["content"],
                         max(128, remaining - 16),
                         chars_per_token=budget.chars_per_token,
+                        token_counter=token_counter,
                     ),
                 }
             )
