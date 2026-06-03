@@ -151,6 +151,29 @@ def torch_cuda_status() -> dict:
         return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def llama_cpp_cuda_status() -> dict:
+    """Whether *llama.cpp* (GGUF backend) was built with GPU offload support.
+
+    ``n_gpu_layers`` is silently ignored when llama-cpp-python is the CPU-only
+    wheel, so a GGUF model runs entirely on CPU even though autofit picked GPU
+    layers. ``llama_supports_gpu_offload()`` is the definitive build check.
+    """
+    try:
+        import llama_cpp
+        supports = None
+        try:
+            supports = bool(llama_cpp.llama_supports_gpu_offload())
+        except Exception:
+            pass
+        return {
+            "installed": True,
+            "version": getattr(llama_cpp, "__version__", None),
+            "supports_gpu_offload": supports,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"installed": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _safe_int(value) -> int | None:
     try:
         return int(str(value).strip())
@@ -654,6 +677,7 @@ def build_app(state: "WorkerState") -> Flask:
                 "name": state.name,
                 "gpus": detect_gpus(),
                 "cuda": torch_cuda_status(),
+                "llama_cpp": llama_cpp_cuda_status(),
                 "assigned_models": state.assigned_models,
                 "provisioning": sorted(state._provisioning),
                 "loaded_models": loaded_model_keys(),
@@ -970,20 +994,32 @@ def main(argv: list[str] | None = None) -> int:
     # serve every model on CPU. Make that loud so it's not mistaken for "slow".
     _gpus = detect_gpus()
     _cuda = torch_cuda_status()
+    _lcpp = llama_cpp_cuda_status()
     if _cuda.get("available"):
-        logger.info("torch CUDA ready: %s (torch %s, cuda %s) — inference uses the GPU",
+        logger.info("torch CUDA ready: %s (torch %s, cuda %s) — transformers models use the GPU",
                     _cuda.get("device_name"), _cuda.get("torch_version"),
                     _cuda.get("cuda_version"))
     elif _gpus:
         logger.warning(
             "GPU(s) detected by nvidia-smi (%s) but torch.cuda.is_available() is "
-            "False — ALL inference will run on CPU. This worker's Python env needs "
-            "a CUDA build of torch. torch=%s cuda=%s err=%s",
+            "False — transformers inference will run on CPU. This worker's Python "
+            "env needs a CUDA build of torch. torch=%s cuda=%s err=%s",
             ", ".join(g.get("name") or "?" for g in _gpus),
             _cuda.get("torch_version"), _cuda.get("cuda_version"), _cuda.get("error"))
     else:
         logger.warning("no usable GPU (nvidia-smi found none and torch has no CUDA); "
                        "inference will run on CPU")
+
+    # GGUF models go through llama.cpp, which needs its OWN CUDA build.
+    if _gpus and _lcpp.get("installed") and _lcpp.get("supports_gpu_offload") is False:
+        logger.warning(
+            "llama-cpp-python is installed WITHOUT GPU offload support — GGUF "
+            "models will run on CPU regardless of n_gpu_layers. Reinstall with "
+            "CUDA: CMAKE_ARGS=\"-DGGML_CUDA=on\" pip install --force-reinstall "
+            "--no-cache-dir llama-cpp-python  (llama_cpp %s)", _lcpp.get("version"))
+    elif _gpus and _lcpp.get("supports_gpu_offload"):
+        logger.info("llama.cpp GPU offload available (llama_cpp %s) — GGUF models "
+                    "can use the GPU", _lcpp.get("version"))
 
     state = WorkerState(name=args.name, url=advertise,
                         worker_id=_load_worker_id(args.id_file),
