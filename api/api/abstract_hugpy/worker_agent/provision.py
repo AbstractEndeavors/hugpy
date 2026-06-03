@@ -25,6 +25,7 @@ finds them with no further config.
 from __future__ import annotations
 
 import os
+import time
 import logging
 import urllib.parse
 import urllib.request
@@ -56,45 +57,66 @@ def _assure_local_key(model_key: str):
         return None
 
 
+def _central_manifest(central_url: str, model_key: str) -> dict:
+    """GET central's file manifest + routing meta for a model key."""
+    base = central_url.rstrip("/") + "/api/llm/models/" + urllib.parse.quote(model_key)
+    return _get_json(base + "/manifest")
+
+
+# Central's model list/config lives under a different prefix than the worker
+# file-share routes, and that prefix has moved between builds. Try the known
+# candidates rather than hard-coding one (which 404'd in the field).
+_MODEL_LIST_PATHS = ("/api/models", "/api/llm/models", "/models")
+
+
 def _fetch_central_model_row(central_url: str, model_key: str) -> dict | None:
-    """Pull one model's config row from central by key, else by scanning the list.
+    """Pull one model's config row from central, however possible.
 
-    Central keys its registry by a short name (e.g. ``DAN-Qwen3-1.7B``) while an
-    inference request may carry the hub_id (``UnfilteredAI/DAN-Qwen3-1.7B``), so
-    a direct ``/models/<key>`` lookup can miss — we then scan ``/models`` and
-    match on key or cleaned hub_id.
+    Order:
+      1. the worker file-share **manifest** endpoint
+         (/api/llm/models/<key>/manifest) — proven to work and it also carries
+         the routing meta we need to register. Used when model_key is central's
+         own single-segment key (e.g. the assignment key ``DAN-Qwen3-1.7B``).
+      2. central's model list/config, trying each known prefix, matching on key
+         OR cleaned hub_id (handles a request that carries the hub_id while
+         central keys the model by a short name).
     """
-    base = central_url.rstrip("/") + "/api/llm/models"
+    # 1) manifest endpoint — reliable, and confirms central actually has files.
+    if "/" not in model_key:
+        try:
+            meta = _central_manifest(central_url, model_key)
+            if isinstance(meta, dict) and meta.get("hub_id"):
+                row = dict(meta)
+                row.setdefault("key", model_key)
+                return row
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (404, 409):
+                logger.warning("central manifest for %s: HTTP %s", model_key, exc.code)
+        except Exception as exc:
+            logger.warning("central manifest for %s failed: %s", model_key, exc)
 
-    # 1) direct config endpoint (works when model_key is central's own key)
-    try:
-        row = _get_json(base + "/" + urllib.parse.quote(model_key, safe=""))
-        if isinstance(row, dict) and (row.get("key") or row.get("model_key")
-                                      or row.get("hub_id")):
-            return row
-    except urllib.error.HTTPError as exc:
-        if exc.code not in (404, 409):
-            logger.warning("central model lookup %s: HTTP %s", model_key, exc.code)
-    except Exception as exc:
-        logger.warning("central model lookup %s failed: %s", model_key, exc)
-
-    # 2) scan the full list, match by key or cleaned hub_id
-    try:
-        listing = _get_json(base)
-    except Exception as exc:
-        logger.warning("central model list failed: %s", exc)
-        return None
-    if not isinstance(listing, list):
-        return None
-
+    # 2) resolve via the model list (handles hub_id + unknown prefix).
     want = _clean_hub(model_key)
-    for row in listing:
-        if not isinstance(row, dict):
+    for path in _MODEL_LIST_PATHS:
+        url = central_url.rstrip("/") + path
+        try:
+            listing = _get_json(url)
+        except Exception:
             continue
-        if (row.get("key") or row.get("model_key")) == model_key:
-            return row
-        if want and _clean_hub(row.get("hub_id")) == want:
-            return row
+        if isinstance(listing, dict):
+            rows = list(listing.values())
+        elif isinstance(listing, list):
+            rows = listing
+        else:
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if (row.get("key") or row.get("model_key")) == model_key:
+                return row
+            if want and _clean_hub(row.get("hub_id")) == want:
+                return row
+    logger.warning("central has no resolvable config for %s", model_key)
     return None
 
 
@@ -223,24 +245,71 @@ def _download_file(url: str, dest_path: str, expected_size: int | None,
                 on_bytes(len(chunk))
 
 
+def _download_with_retry(url: str, dest_path: str, expected_size: int | None,
+                         on_bytes=None, attempts: int = 4) -> None:
+    """Download one file, retrying transient failures with backoff.
+
+    Verifies the on-disk size against ``expected_size`` (when known) and retries
+    until it matches, so a truncated/short file never passes as complete. Raises
+    the last error if every attempt fails. Progress (``on_bytes``) is reported
+    only on the first attempt to avoid double-counting on retry.
+    """
+    last_exc: Exception | None = None
+    for i in range(attempts):
+        try:
+            _download_file(url, dest_path, expected_size,
+                           on_bytes=on_bytes if i == 0 else None)
+            if expected_size is None:
+                return
+            if os.path.exists(dest_path) and os.path.getsize(dest_path) == expected_size:
+                return
+            last_exc = RuntimeError(
+                f"size mismatch for {os.path.basename(dest_path)}: "
+                f"{os.path.getsize(dest_path) if os.path.exists(dest_path) else 0}"
+                f"/{expected_size}")
+        except Exception as exc:  # noqa: BLE001 — retry transient network errors
+            last_exc = exc
+        time.sleep(min(2 ** i, 8))
+    raise last_exc or RuntimeError(f"failed to download {url}")
+
+
+def _missing_or_short(dest: str, files: list[dict]) -> list[tuple]:
+    """Return [(rel, expected_size, reason)] for files not fully present."""
+    out = []
+    for entry in files:
+        rel = entry.get("path")
+        if not rel:
+            continue
+        size = entry.get("size")
+        target = os.path.join(dest, rel)
+        if not os.path.exists(target):
+            out.append((rel, size, "absent"))
+        elif size is not None and os.path.getsize(target) != size:
+            out.append((rel, size, "short"))
+    return out
+
+
 def fetch_from_central(central_url: str, model_key: str, progress=None) -> bool:
-    """Pull a model's files from central into the worker's storage.
+    """Pull a model's ENTIRE directory from central into the worker's storage.
 
     ``progress(done_bytes, total_bytes, filename)`` is called as bytes arrive.
-    Returns True on success, False if central doesn't have the model (so the
-    caller can fall back to Hugging Face). Raises on hard network errors only
-    when central was reachable but failed mid-transfer.
+    Returns True only once **every** file in central's manifest is present at its
+    expected size — transient per-file failures are retried, then the whole set
+    is re-verified and any missing/short file re-fetched. Returns False if
+    central simply doesn't have the model (404/409) so the caller may try HF;
+    raises if central has it but the transfer can't be completed (so a partial
+    directory is never mistaken for a usable one).
     """
     base = central_url.rstrip("/") + "/api/llm/models/" + urllib.parse.quote(model_key)
     try:
         manifest = _get_json(base + "/manifest")
     except urllib.error.HTTPError as exc:
         if exc.code in (404, 409):
-            logger.info("central has no copy of %s (HTTP %s); will try HF", model_key, exc.code)
+            logger.info("central has no copy of %s (HTTP %s)", model_key, exc.code)
             return False
         raise
     except urllib.error.URLError as exc:
-        logger.warning("central unreachable for %s (%s); will try HF", model_key, exc)
+        logger.warning("central unreachable for %s (%s)", model_key, exc)
         return False
 
     dest = _local_destination(manifest)
@@ -267,9 +336,40 @@ def fetch_from_central(central_url: str, model_key: str, progress=None) -> bool:
             done += n
             _emit(_rel)
 
-        _download_file(url, target, size, on_bytes=_on_bytes)
+        # Attempt every file; a single hard failure must not abort the whole
+        # transfer — the completeness gate below re-fetches whatever is missing
+        # and raises a clear aggregate error if it still can't be completed.
+        try:
+            _download_with_retry(url, target, size, on_bytes=_on_bytes)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("download of %s failed: %s; will re-try in verify pass",
+                           rel, exc)
 
-    logger.info("provisioned %s from central", model_key)
+    # Completeness gate: re-verify the whole manifest and re-fetch anything that
+    # didn't fully land, so we never declare success on a partial directory.
+    for _ in range(3):
+        missing = _missing_or_short(dest, files)
+        if not missing:
+            break
+        logger.warning("central transfer of %s incomplete: %d/%d files "
+                       "missing/short; re-fetching", model_key, len(missing), len(files))
+        for rel, size, _why in missing:
+            url = base + "/file?path=" + urllib.parse.quote(rel)
+            target = os.path.join(dest, rel)
+            try:
+                _download_with_retry(url, target, size)
+            except Exception as exc:  # noqa: BLE001 — keep going; final gate decides
+                logger.warning("re-fetch of %s failed: %s", rel, exc)
+
+    missing = _missing_or_short(dest, files)
+    if missing:
+        raise RuntimeError(
+            f"central transfer of {model_key} incomplete: "
+            f"{len(missing)}/{len(files)} files still missing/short "
+            f"(e.g. {missing[0][0]} [{missing[0][2]}]) under {dest}")
+
+    logger.info("provisioned %s from central in full (%d files, %s)",
+                model_key, len(files), _human(total))
     return True
 
 
