@@ -325,17 +325,96 @@ def _missing_or_short(dest: str, files: list[dict]) -> list[tuple]:
     return out
 
 
-def fetch_from_central(central_url: str, model_key: str, progress=None) -> bool:
-    """Pull a model's ENTIRE directory from central into the worker's storage.
+def _pull_concurrency() -> int:
+    """Max simultaneous connections for a transfer (env HUGPY_PULL_CONCURRENCY)."""
+    try:
+        return max(1, int(os.environ.get("HUGPY_PULL_CONCURRENCY", "8")))
+    except ValueError:
+        return 8
 
-    ``progress(done_bytes, total_bytes, filename)`` is called as bytes arrive.
-    Returns True only once **every** file in central's manifest is present at its
-    expected size — transient per-file failures are retried, then the whole set
-    is re-verified and any missing/short file re-fetched. Returns False if
-    central simply doesn't have the model (404/409) so the caller may try HF;
-    raises if central has it but the transfer can't be completed (so a partial
-    directory is never mistaken for a usable one).
+
+# Files bigger than this are split into byte-range segments fetched in parallel,
+# so a single multi-GB weights file isn't stuck on one connection.
+_SEGMENT_MIN_BYTES = 64 * 1024 * 1024
+_SEGMENT_BYTES = 64 * 1024 * 1024
+
+
+def _supports_range(url: str) -> bool:
+    """True if central honours HTTP Range (returns 206) for this file URL."""
+    try:
+        req = urllib.request.Request(url, headers={"Range": "bytes=0-0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.getcode() == 206
+    except Exception:
+        return False
+
+
+def _download_segment(url: str, dest_path: str, start: int, end: int,
+                      on_bytes=None) -> None:
+    """Fetch one inclusive byte range [start, end] into dest_path at its offset."""
+    req = urllib.request.Request(url, headers={"Range": f"bytes={start}-{end}"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        if resp.getcode() != 206:
+            raise RuntimeError("server ignored Range request")
+        remaining = end - start + 1
+        with open(dest_path, "r+b") as fh:
+            fh.seek(start)
+            while remaining > 0:
+                chunk = resp.read(min(_CHUNK, remaining))
+                if not chunk:
+                    break
+                fh.write(chunk)
+                remaining -= len(chunk)
+                if on_bytes:
+                    on_bytes(len(chunk))
+    if remaining > 0:
+        raise RuntimeError(f"short segment {start}-{end} of {dest_path}")
+
+
+def _download_segment_with_retry(url, dest_path, start, end, on_bytes=None,
+                                 attempts: int = 4) -> None:
+    last_exc: Exception | None = None
+    for i in range(attempts):
+        try:
+            _download_segment(url, dest_path, start, end,
+                              on_bytes=on_bytes if i == 0 else None)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            time.sleep(min(2 ** i, 8))
+    raise last_exc or RuntimeError(f"failed segment {start}-{end} of {url}")
+
+
+def _segment_ranges(size: int) -> list[tuple[int, int]]:
+    """Inclusive (start, end) ranges covering a file, ~_SEGMENT_BYTES each."""
+    nseg = max(1, min(_pull_concurrency() * 4, -(-size // _SEGMENT_BYTES)))
+    step = -(-size // nseg)  # ceil
+    ranges = []
+    start = 0
+    while start < size:
+        end = min(start + step, size) - 1
+        ranges.append((start, end))
+        start += step
+    return ranges
+
+
+def fetch_from_central(central_url: str, model_key: str, progress=None) -> bool:
+    """Pull a model's ENTIRE directory from central — parallel and segmented.
+
+    Speed comes from two kinds of parallelism over central's existing ``/file``
+    endpoint (which supports HTTP Range): small files download concurrently, and
+    each large file is split into byte-range segments fetched concurrently, so a
+    single multi-GB weights file isn't bottlenecked on one connection. Total
+    simultaneous connections are capped at ``HUGPY_PULL_CONCURRENCY`` (default 8).
+
+    Only files not already complete on disk are fetched (file-level resume).
+    ``progress(done_bytes, total_bytes, name)`` reports aggregate bytes. Returns
+    True only once every manifest file is present at its expected size (verified,
+    with re-fetch of any gap); False if central lacks the model (404/409); raises
+    if central has it but the transfer can't be completed.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     base = central_url.rstrip("/") + "/api/llm/models/" + urllib.parse.quote(model_key)
     try:
         manifest = _get_json(base + "/manifest")
@@ -351,51 +430,90 @@ def fetch_from_central(central_url: str, model_key: str, progress=None) -> bool:
     dest = _local_destination(manifest)
     files = manifest.get("files") or []
     total = manifest.get("total_bytes") or sum((e.get("size") or 0) for e in files)
-    logger.info("provisioning %s from central: %d files (%s) -> %s",
-                model_key, len(files), _human(total), dest)
+    concurrency = _pull_concurrency()
 
-    done = 0
+    # File-level resume: only fetch what isn't already complete. If nothing is
+    # pending, this is a pure no-op (not even a Range probe).
+    pending = [{"path": r, "size": s} for r, s, _w in _missing_or_short(dest, files)]
+    if not pending:
+        logger.info("%s already complete on disk (%d files)", model_key, len(files))
+        return True
 
-    def _emit(fname):
-        if progress:
-            progress(done, total, fname)
+    # Range support lets us segment big files; probe once on the largest pending.
+    ranged_ok = False
+    biggest = max(pending, key=lambda e: e.get("size") or 0)
+    if (biggest.get("size") or 0) >= _SEGMENT_MIN_BYTES:
+        ranged_ok = _supports_range(
+            base + "/file?path=" + urllib.parse.quote(biggest["path"]))
 
-    _emit("")
-    for entry in files:
-        rel = entry["path"]
-        size = entry.get("size")
+    logger.info("provisioning %s from central: %d files (%s), %d-way parallel"
+                "%s -> %s", model_key, len(files), _human(total), concurrency,
+                " (segmented)" if ranged_ok else "", dest)
+
+    done_lock = threading.Lock()
+    pstate = {"done": 0, "last": 0.0}
+
+    def _on_bytes(n):
+        if not progress:
+            return
+        with done_lock:
+            pstate["done"] += n
+            now = time.time()
+            if now - pstate["last"] < 0.3 and pstate["done"] < total:
+                return
+            pstate["last"] = now
+            done = pstate["done"]
+        progress(min(done, total) if total else done, total, "files")
+
+    def _build_units(entries):
+        """Flatten entries into download units, capping total connections.
+
+        A unit is (rel, size, start, end); start/end None means whole file.
+        Large files (with Range support) become several segment units.
+        """
+        units = []
+        for entry in entries:
+            rel, size = entry["path"], entry.get("size")
+            target = os.path.join(dest, rel)
+            if ranged_ok and size and size >= _SEGMENT_MIN_BYTES:
+                os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+                with open(target, "wb") as fh:   # preallocate for offset writes
+                    fh.truncate(size)
+                for start, end in _segment_ranges(size):
+                    units.append((rel, size, start, end))
+            else:
+                units.append((rel, size, None, None))
+        return units
+
+    def _run_unit(unit):
+        rel, size, start, end = unit
         url = base + "/file?path=" + urllib.parse.quote(rel)
         target = os.path.join(dest, rel)
-
-        def _on_bytes(n, _rel=rel):
-            nonlocal done
-            done += n
-            _emit(_rel)
-
-        # Attempt every file; a single hard failure must not abort the whole
-        # transfer — the completeness gate below re-fetches whatever is missing
-        # and raises a clear aggregate error if it still can't be completed.
         try:
-            _download_with_retry(url, target, size, on_bytes=_on_bytes)
-        except Exception as exc:  # noqa: BLE001
+            if start is None:
+                _download_with_retry(url, target, size, on_bytes=_on_bytes)
+            else:
+                _download_segment_with_retry(url, target, start, end, on_bytes=_on_bytes)
+        except Exception as exc:  # noqa: BLE001 — gate below re-fetches/decides
             logger.warning("download of %s failed: %s; will re-try in verify pass",
                            rel, exc)
 
-    # Completeness gate: re-verify the whole manifest and re-fetch anything that
-    # didn't fully land, so we never declare success on a partial directory.
+    def _parallel(entries):
+        units = _build_units(entries)
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(_run_unit, units))
+
+    # Initial pass over the pending files (computed above).
+    _parallel(pending)
+
+    # Completeness gate: re-verify and re-fetch anything that didn't fully land.
     for _ in range(3):
         missing = _missing_or_short(dest, files)
         if not missing:
             break
         logger.warning("central transfer of %s incomplete: %d/%d files "
                        "missing/short; re-fetching", model_key, len(missing), len(files))
-        for rel, size, _why in missing:
-            url = base + "/file?path=" + urllib.parse.quote(rel)
-            target = os.path.join(dest, rel)
-            try:
-                _download_with_retry(url, target, size)
-            except Exception as exc:  # noqa: BLE001 — keep going; final gate decides
-                logger.warning("re-fetch of %s failed: %s", rel, exc)
+        _parallel([{"path": rel, "size": size} for rel, size, _why in missing])
 
     missing = _missing_or_short(dest, files)
     if missing:
@@ -591,21 +709,22 @@ def _provision_now(canonical: str, central_url: str | None, progress=None) -> bo
     # central can't provide the files (no central URL, central unreachable, or
     # central doesn't have them on disk).
     if central_url:
-        # 1) whole-directory tar stream — one sequential transfer, most reliable.
-        try:
-            if fetch_archive_from_central(central_url, canonical, progress=progress):
-                return True
-        except Exception as exc:
-            logger.warning("central archive transfer of %s failed: %s; "
-                           "trying per-file", canonical, exc)
-        # 2) per-file transfer (also fills any gap a partial archive left).
+        # 1) parallel + segmented per-file transfer — fastest (saturates the
+        #    link; a big weights file is split across many connections).
         try:
             if fetch_from_central(central_url, canonical, progress=progress):
+                return True
+        except Exception as exc:
+            logger.warning("central parallel transfer of %s failed: %s; "
+                           "trying archive", canonical, exc)
+        # 2) whole-directory tar stream — single-connection fallback.
+        try:
+            if fetch_archive_from_central(central_url, canonical, progress=progress):
                 return True
             logger.info("central cannot provide %s; falling back to Hugging Face",
                         canonical)
         except Exception as exc:
-            logger.warning("central per-file provisioning of %s failed: %s; "
+            logger.warning("central archive transfer of %s failed: %s; "
                            "falling back to Hugging Face", canonical, exc)
     else:
         logger.info("no central URL configured; provisioning %s from Hugging Face",
