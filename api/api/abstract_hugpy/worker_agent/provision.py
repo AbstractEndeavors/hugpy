@@ -373,6 +373,85 @@ def fetch_from_central(central_url: str, model_key: str, progress=None) -> bool:
     return True
 
 
+def fetch_archive_from_central(central_url: str, model_key: str, progress=None) -> bool:
+    """Pull the model's ENTIRE directory from central as one streamed tar.
+
+    Downloads central's ``/archive`` endpoint and extracts it on the fly (no
+    temp tar on disk, bounded memory), confining every member to the model's
+    destination, then verifies the result against central's manifest. This is
+    the primary transport: one sequential stream can't "drop" files the way N
+    independent GETs can.
+
+    Returns True once the directory is present in full. Returns False if central
+    can't serve an archive — the endpoint is missing on an older central
+    (404/405) or central doesn't have the model (404/409) — so the caller can
+    fall back to the per-file transfer. Raises if the archive arrived but
+    couldn't be completed (so a partial directory is never reported as success).
+    """
+    import tarfile
+
+    base = central_url.rstrip("/") + "/api/llm/models/" + urllib.parse.quote(model_key)
+
+    # Manifest gives us the destination + the file set to verify against.
+    try:
+        manifest = _get_json(base + "/manifest")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 409):
+            logger.info("central has no copy of %s (HTTP %s)", model_key, exc.code)
+            return False
+        raise
+    except urllib.error.URLError as exc:
+        logger.warning("central unreachable for %s (%s)", model_key, exc)
+        return False
+
+    dest = _local_destination(manifest)
+    files = manifest.get("files") or []
+    total = manifest.get("total_bytes") or sum((e.get("size") or 0) for e in files)
+    dest_real = os.path.realpath(dest)
+    os.makedirs(dest, exist_ok=True)
+
+    logger.info("provisioning %s from central archive: %d files (%s) -> %s",
+                model_key, len(files), _human(total), dest)
+
+    try:
+        resp = urllib.request.urlopen(base + "/archive", timeout=120)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 405, 409):
+            logger.info("central has no archive endpoint for %s (HTTP %s); "
+                        "will use per-file transfer", model_key, exc.code)
+            return False
+        raise
+    except urllib.error.URLError as exc:
+        logger.warning("central archive unreachable for %s (%s)", model_key, exc)
+        return False
+
+    extracted = 0
+    # mode "r|" = sequential streaming read, matching central's "w|" writer.
+    with resp, tarfile.open(fileobj=resp, mode="r|") as tar:
+        for member in tar:
+            target = os.path.realpath(os.path.join(dest, member.name))
+            if target != dest_real and not target.startswith(dest_real + os.sep):
+                raise RuntimeError(f"unsafe path in archive member: {member.name!r}")
+            tar.extract(member, dest)
+            if member.isfile():
+                extracted += 1
+                if progress:
+                    progress(min(total, extracted * (total // max(len(files), 1))),
+                             total, member.name)
+
+    # Completeness gate against the manifest.
+    missing = _missing_or_short(dest, files)
+    if missing:
+        raise RuntimeError(
+            f"central archive of {model_key} incomplete after extract: "
+            f"{len(missing)}/{len(files)} files missing/short "
+            f"(e.g. {missing[0][0]} [{missing[0][2]}]) under {dest}")
+
+    logger.info("provisioned %s from central archive in full (%d files, %s)",
+                model_key, len(files), _human(total))
+    return True
+
+
 def _human(n) -> str:
     if not n:
         return "?"
@@ -413,13 +492,21 @@ def ensure_model_present(model_key: str, central_url: str | None, progress=None)
     # central can't provide the files (no central URL, central unreachable, or
     # central doesn't have them on disk).
     if central_url:
+        # 1) whole-directory tar stream — one sequential transfer, most reliable.
+        try:
+            if fetch_archive_from_central(central_url, canonical, progress=progress):
+                return True
+        except Exception as exc:
+            logger.warning("central archive transfer of %s failed: %s; "
+                           "trying per-file", canonical, exc)
+        # 2) per-file transfer (also fills any gap a partial archive left).
         try:
             if fetch_from_central(central_url, canonical, progress=progress):
                 return True
             logger.info("central cannot provide %s; falling back to Hugging Face",
                         canonical)
         except Exception as exc:
-            logger.warning("central provisioning of %s failed: %s; "
+            logger.warning("central per-file provisioning of %s failed: %s; "
                            "falling back to Hugging Face", canonical, exc)
     else:
         logger.info("no central URL configured; provisioning %s from Hugging Face",

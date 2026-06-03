@@ -328,6 +328,71 @@ def model_file(model_key):
                      conditional=True)
 
 
+@worker_bp.route("/llm/models/<model_key>/archive", methods=["GET"])
+def model_archive(model_key):
+    """Stream the model's ENTIRE directory as one uncompressed tar.
+
+    This is the most reliable way to hand a worker a whole model: a single
+    sequential stream instead of N per-file GETs that can drop files. The tar is
+    produced on the fly through an OS pipe driven by a writer thread, so central
+    never buffers the model (which can be many GB) in memory or stages it on
+    disk. Members are stored at paths relative to the model dir, so the worker
+    extracts straight into its own destination.
+
+    Uncompressed (``w|``) on purpose: model weights are incompressible, so gzip
+    would only burn CPU on both ends.
+    """
+    import tarfile
+    import threading
+
+    _model, dest = _model_dir_or_404(model_key)
+
+    # Deterministic file list (same walk as the manifest), newest layout intact.
+    entries = []
+    for root, _dirs, names in os.walk(dest):
+        for name in sorted(names):
+            full = os.path.join(root, name)
+            if os.path.isfile(full):
+                entries.append((full, os.path.relpath(full, dest)))
+
+    def generate():
+        r_fd, w_fd = os.pipe()
+
+        def _writer():
+            try:
+                with os.fdopen(w_fd, "wb") as wf:
+                    with tarfile.open(fileobj=wf, mode="w|") as tar:
+                        for full, rel in entries:
+                            try:
+                                tar.add(full, arcname=rel, recursive=False)
+                            except FileNotFoundError:
+                                continue  # file vanished mid-stream; skip it
+            except Exception:
+                logger.exception("archive writer failed for %s", model_key)
+
+        thread = threading.Thread(target=_writer, daemon=True)
+        thread.start()
+        try:
+            with os.fdopen(r_fd, "rb") as rf:
+                while True:
+                    chunk = rf.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            thread.join()
+
+    return Response(
+        generate(),
+        mimetype="application/x-tar",
+        headers={
+            "Content-Disposition": f'attachment; filename="{model_key}.tar"',
+            "X-Accel-Buffering": "no",
+        },
+        direct_passthrough=True,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Central-driven worker install.
 #
