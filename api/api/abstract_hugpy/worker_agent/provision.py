@@ -308,12 +308,22 @@ def ensure_model_present(model_key: str, central_url: str | None, progress=None)
     if model_is_local(canonical):
         return True
 
+    # Priority: get the model FILES from CENTRAL first — it's the source of
+    # truth and needs no HF token. Hugging Face is only a fallback, used when
+    # central can't provide the files (no central URL, central unreachable, or
+    # central doesn't have them on disk).
     if central_url:
         try:
             if fetch_from_central(central_url, canonical, progress=progress):
                 return True
+            logger.info("central cannot provide %s; falling back to Hugging Face",
+                        canonical)
         except Exception as exc:
-            logger.warning("central provisioning of %s failed: %s; trying HF", canonical, exc)
+            logger.warning("central provisioning of %s failed: %s; "
+                           "falling back to Hugging Face", canonical, exc)
+    else:
+        logger.info("no central URL configured; provisioning %s from Hugging Face",
+                    canonical)
 
     try:
         if progress:
@@ -321,6 +331,6 @@ def ensure_model_present(model_key: str, central_url: str | None, progress=None)
         fetch_from_hf(canonical)
         return True
     except Exception as exc:
-        logger.error("could not provision %s from HF: %s", canonical, exc)
+        logger.error("could not provision %s from central or HF: %s", canonical, exc)
         return False
 
