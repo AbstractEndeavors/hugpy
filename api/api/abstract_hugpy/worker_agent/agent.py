@@ -131,6 +131,26 @@ def _detect_gpus_torch() -> list[dict]:
         return []
 
 
+def torch_cuda_status() -> dict:
+    """Whether *torch* can actually use CUDA — distinct from nvidia-smi seeing a
+    card. Inference runs on the GPU only when ``torch.cuda.is_available()`` is
+    True; a CPU-only torch build (or a torch/CUDA-driver mismatch) leaves a
+    perfectly good GPU unused. Surfaced in /health so this is diagnosable.
+    """
+    try:
+        import torch
+        available = bool(torch.cuda.is_available())
+        return {
+            "available": available,
+            "device_count": torch.cuda.device_count() if available else 0,
+            "device_name": torch.cuda.get_device_name(0) if available else None,
+            "torch_version": getattr(torch, "__version__", None),
+            "cuda_version": getattr(getattr(torch, "version", None), "cuda", None),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _safe_int(value) -> int | None:
     try:
         return int(str(value).strip())
@@ -633,6 +653,7 @@ def build_app(state: "WorkerState") -> Flask:
                 "worker_id": state.worker_id,
                 "name": state.name,
                 "gpus": detect_gpus(),
+                "cuda": torch_cuda_status(),
                 "assigned_models": state.assigned_models,
                 "provisioning": sorted(state._provisioning),
                 "loaded_models": loaded_model_keys(),
@@ -945,6 +966,25 @@ def main(argv: list[str] | None = None) -> int:
         if ip:
             advertise = f"http://{ip}:{args.port}"
             logger.info("advertising self as %s (local IP toward central)", advertise)
+    # Surface GPU usability up front: a worker that can't use CUDA will silently
+    # serve every model on CPU. Make that loud so it's not mistaken for "slow".
+    _gpus = detect_gpus()
+    _cuda = torch_cuda_status()
+    if _cuda.get("available"):
+        logger.info("torch CUDA ready: %s (torch %s, cuda %s) — inference uses the GPU",
+                    _cuda.get("device_name"), _cuda.get("torch_version"),
+                    _cuda.get("cuda_version"))
+    elif _gpus:
+        logger.warning(
+            "GPU(s) detected by nvidia-smi (%s) but torch.cuda.is_available() is "
+            "False — ALL inference will run on CPU. This worker's Python env needs "
+            "a CUDA build of torch. torch=%s cuda=%s err=%s",
+            ", ".join(g.get("name") or "?" for g in _gpus),
+            _cuda.get("torch_version"), _cuda.get("cuda_version"), _cuda.get("error"))
+    else:
+        logger.warning("no usable GPU (nvidia-smi found none and torch has no CUDA); "
+                       "inference will run on CPU")
+
     state = WorkerState(name=args.name, url=advertise,
                         worker_id=_load_worker_id(args.id_file),
                         central_url=args.central)
