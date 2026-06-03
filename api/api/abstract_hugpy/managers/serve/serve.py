@@ -59,6 +59,10 @@ LLAMA_SWAP_TTL = int(get_env_value("LLAMA_SWAP_TTL") or 600)   # on-demand unloa
 
 DEFAULT_LLAMA_CTX = int(get_env_value("DEFAULT_LLAMA_CTX") or 4096)
 DEFAULT_LLAMA_THREADS = int(get_env_value("DEFAULT_LLAMA_THREADS") or 6)
+# GPU offload for llama-server. -1 = put every layer on the GPU (the right
+# default for a CUDA-built llama-server); 0 = CPU only; N = first N layers.
+# Without this flag llama-server defaults to CPU — the usual "GPU sits idle".
+DEFAULT_LLAMA_NGL = int(get_env_value("DEFAULT_LLAMA_NGL") or -1)
 DEFAULT_SERVE_MODE = get_env_value("DEFAULT_SERVE_MODE") or "systemd"
 
 
@@ -137,6 +141,7 @@ class ServeSpec:
     port: Optional[int] = None
     ctx_size: int = DEFAULT_LLAMA_CTX
     threads: int = DEFAULT_LLAMA_THREADS
+    n_gpu_layers: int = DEFAULT_LLAMA_NGL
     always_on: bool = True
     ttl_seconds: Optional[int] = None
     user: str = LLAMA_SERVICE_USER
@@ -189,6 +194,7 @@ def serve_spec_for(model_key=None, *, cfg=None) -> ServeSpec:
         port=port,
         ctx_size=_ctx_for(cfg, model_key),
         threads=int(extra.get("threads") or DEFAULT_LLAMA_THREADS),
+        n_gpu_layers=int(extra.get("n_gpu_layers", DEFAULT_LLAMA_NGL)),
         always_on=bool(extra.get("always_on", True)),
         ttl_seconds=extra.get("ttl_seconds") or (None if extra.get("always_on", True) else LLAMA_SWAP_TTL),
         extra_args=tuple(extra.get("llama_extra_args") or ()),
@@ -316,12 +322,19 @@ class SystemdDriver:
             f"--port {spec.port}",
             f"-c {spec.ctx_size}",
             f"-t {spec.threads}",
+            # GPU offload — without this llama-server runs CPU-only.
+            f"--n-gpu-layers {spec.n_gpu_layers}",
             *spec.extra_args,
         ))
         return "\n".join((
             "[Unit]",
             f"Description=llama.cpp server for {spec.model_key}",
             "After=network.target",
+            # Restart-loop limiter lives in [Unit] (systemd ignores it in
+            # [Service] — 'Unknown key name StartLimitIntervalSec in section
+            # Service'). Caps thrash on a bad GGUF.
+            "StartLimitIntervalSec=120",
+            "StartLimitBurst=5",
             "",
             "[Service]",
             "Type=simple",
@@ -331,10 +344,6 @@ class SystemdDriver:
             f"ExecStart={exec_start}",
             "Restart=always",
             "RestartSec=5",
-            # cap restart loops so a bad GGUF can't thrash while the app
-            # silently double-loads it in-process via the fallback
-            "StartLimitIntervalSec=120",
-            "StartLimitBurst=5",
             "TimeoutStartSec=300",
             "TimeoutStopSec=30",
             "",
@@ -391,6 +400,7 @@ class SwapDriver:
                 spec.server_bin, "-m", spec.model_file,
                 "--host", "127.0.0.1", "--port", "${PORT}",
                 "-c", str(spec.ctx_size), "-t", str(spec.threads),
+                "--n-gpu-layers", str(spec.n_gpu_layers),
                 *spec.extra_args,
             ))
             entry = {"cmd": cmd}
@@ -504,6 +514,7 @@ def serving_overview(registry=None):
             "always_on": spec.always_on,
             "endpoint": driver.endpoint(spec),
             "model_name": driver.model_name(spec),
+            "n_gpu_layers": spec.n_gpu_layers,
             "ttl_seconds": spec.ttl_seconds,
         })
     return rows
