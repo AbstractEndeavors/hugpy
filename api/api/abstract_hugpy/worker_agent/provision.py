@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import time
 import logging
+import threading
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -34,6 +35,22 @@ import urllib.error
 logger = logging.getLogger("abstract_hugpy.worker_agent.provision")
 
 _CHUNK = 8 * 1024 * 1024  # 8 MiB streaming chunks
+
+# Single-flight provisioning: one download per model_key at a time. Without this
+# every concurrent /infer/stream (plus the pre-provision) kicks off its own full
+# multi-GB transfer into the SAME directory, and the parallel writers stomp each
+# other (the symptom: a transfer "stuck" partway). Waiters block, then find the
+# model already present and return immediately.
+_PROVISION_LOCKS: dict[str, threading.Lock] = {}
+_PROVISION_LOCKS_GUARD = threading.Lock()
+
+
+def _provision_lock(model_key: str) -> threading.Lock:
+    with _PROVISION_LOCKS_GUARD:
+        lock = _PROVISION_LOCKS.get(model_key)
+        if lock is None:
+            lock = _PROVISION_LOCKS[model_key] = threading.Lock()
+        return lock
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +504,27 @@ def ensure_model_present(model_key: str, central_url: str | None, progress=None)
     if model_is_local(canonical):
         return True
 
+    # Single-flight: serialize provisioning of this model so concurrent callers
+    # (multiple infer requests + the pre-provision) don't each download it in
+    # parallel into the same directory.
+    lock = _provision_lock(canonical)
+    if not lock.acquire(blocking=False):
+        logger.info("provisioning of %s already in progress; waiting for it",
+                    canonical)
+        lock.acquire()
+    try:
+        # Another thread may have finished the download while we waited.
+        if model_is_local(canonical):
+            logger.info("%s became available while waiting; using it", canonical)
+            return True
+        return _provision_now(canonical, central_url, progress=progress)
+    finally:
+        lock.release()
+
+
+def _provision_now(canonical: str, central_url: str | None, progress=None) -> bool:
+    """Do the actual fetch (central archive -> per-file -> HF). Caller holds the
+    per-model provisioning lock."""
     # Priority: get the model FILES from CENTRAL first — it's the source of
     # truth and needs no HF token. Hugging Face is only a fallback, used when
     # central can't provide the files (no central URL, central unreachable, or
