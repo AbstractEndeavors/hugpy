@@ -65,6 +65,11 @@ DEFAULT_LLAMA_THREADS = int(get_env_value("DEFAULT_LLAMA_THREADS") or 6)
 DEFAULT_LLAMA_NGL = int(get_env_value("DEFAULT_LLAMA_NGL") or -1)
 DEFAULT_SERVE_MODE = get_env_value("DEFAULT_SERVE_MODE") or "systemd"
 
+# Deterministic auto-port range for systemd units when a model has no explicit
+# port. Wide span keeps hash collisions rare; an explicit cfg.port always wins.
+LLAMA_PORT_BASE = int(get_env_value("LLAMA_PORT_BASE") or 7001)
+LLAMA_PORT_SPAN = int(get_env_value("LLAMA_PORT_SPAN") or 4000)
+
 
 class ServeMode(str, Enum):
     OFF = "off"
@@ -116,16 +121,34 @@ def _model_file_for(model_key, cfg):
     return ""
 
 
+def _auto_port(model_key: str) -> int:
+    """Deterministic per-model port so a GGUF model can get a systemd unit
+    without hand-assigning one. Stable across runs and identical whether
+    resolved for a single model (the HTTP runner) or the whole batch (install),
+    so the endpoint and the unit always agree. Explicit cfg.port still wins.
+    """
+    import hashlib
+    h = int(hashlib.sha1(model_key.encode("utf-8")).hexdigest(), 16)
+    return LLAMA_PORT_BASE + (h % LLAMA_PORT_SPAN)
+
+
+def _resolve_port(model_key, cfg) -> int:
+    p = getattr(cfg, "port", None)
+    try:
+        if p is not None and int(p) > 0:
+            return int(p)
+    except (TypeError, ValueError):
+        pass
+    return _auto_port(model_key)
+
+
 def _resolve_mode(cfg) -> ServeMode:
     if getattr(cfg, "framework", None) != "llama_cpp":
         return ServeMode.OFF
     explicit = (getattr(cfg, "extra", {}) or {}).get("serve_mode")
-    mode = ServeMode(explicit) if explicit else ServeMode(DEFAULT_SERVE_MODE)
-    if mode is ServeMode.SYSTEMD and not getattr(cfg, "port", None):
-        # a dedicated unit needs its own port; without one it can't be systemd
-        logger.info("%s: systemd mode but no port; falling back to off", cfg.model_key)
-        return ServeMode.OFF
-    return mode
+    # systemd no longer falls back to off for a missing port — _resolve_port
+    # auto-assigns a deterministic one.
+    return ServeMode(explicit) if explicit else ServeMode(DEFAULT_SERVE_MODE)
 
 
 # --------------------------------------------------------------------------- #
@@ -181,7 +204,7 @@ def serve_spec_for(model_key=None, *, cfg=None) -> ServeSpec:
     if mode is ServeMode.SWAP:
         host, port = LLAMA_SWAP_HOST, LLAMA_SWAP_PORT
     elif mode is ServeMode.SYSTEMD:
-        host, port = _bare_host(getattr(cfg, "host", None)), int(cfg.port)
+        host, port = _bare_host(getattr(cfg, "host", None)), _resolve_port(model_key, cfg)
     else:
         host = _bare_host(getattr(cfg, "host", None))
         port = int(cfg.port) if getattr(cfg, "port", None) else None
@@ -210,7 +233,6 @@ def build_serve_specs(registry=None, *, only=None):
             continue
         spec = serve_spec_for(key, cfg=cfg)
         specs[key] = spec
-    _assert_no_port_collisions([s for s in specs.values() if s.mode is ServeMode.SYSTEMD])
     return specs
 
 
@@ -482,6 +504,8 @@ def install_serving(*, only=None, registry=None) -> ServePlan:
     """One plan that stands up everything. Batches by mode so all swap models
     land in one config write, each systemd model in its own unit."""
     specs = build_serve_specs(registry=registry, only=only)
+    # Only the units we're about to write must not clash on a port.
+    _assert_no_port_collisions([s for s in specs.values() if s.mode is ServeMode.SYSTEMD])
     by_mode = {}
     for spec in specs.values():
         by_mode.setdefault(spec.mode, []).append(spec)
