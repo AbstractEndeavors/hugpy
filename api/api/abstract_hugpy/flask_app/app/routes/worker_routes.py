@@ -468,6 +468,53 @@ def serving_set(model_key):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Model slots — the live pool of generic slot supervisors.
+#
+# GET  /api/llm/slots                what each slot is serving + free VRAM
+# POST /api/llm/slots/load           {"model_key": ...}  load into a free slot
+# POST /api/llm/slots/unload         {"control": "http://...:8101"}  free a slot
+# GET  /api/llm/slots/install        one-time install steps (dry run; sudo to do)
+# ──────────────────────────────────────────────────────────────────────────
+@worker_bp.route("/llm/slots", methods=["GET"])
+def slots_overview():
+    from abstract_hugpy.managers.serve.slots import SlotPool, slots_enabled
+    if not slots_enabled():
+        return jsonify({"enabled": False, "slots": []})
+    return jsonify({"enabled": True, "slots": SlotPool().overview()})
+
+
+@worker_bp.route("/llm/slots/load", methods=["POST"])
+def slots_load():
+    from abstract_hugpy.managers.serve.slots import SlotPool
+    body = request.get_json(silent=True) or {}
+    if not body.get("model_key"):
+        return jsonify({"error": "missing model_key"}), 400
+    endpoint = SlotPool().endpoint_for(body["model_key"])
+    if endpoint is None:
+        return jsonify({"loaded": False, "reason": "all slots busy",
+                        "slots": SlotPool().overview()}), 409
+    return jsonify({"loaded": True, "endpoint": endpoint,
+                    "slots": SlotPool().overview()})
+
+
+@worker_bp.route("/llm/slots/unload", methods=["POST"])
+def slots_unload():
+    from abstract_hugpy.managers.serve.slots import SlotPool
+    body = request.get_json(silent=True) or {}
+    control = body.get("control")
+    if not control:
+        return jsonify({"error": "missing control url"}), 400
+    return jsonify(SlotPool().unload(control))
+
+
+@worker_bp.route("/llm/slots/install", methods=["GET"])
+def slots_install():
+    from abstract_hugpy.managers.serve.slots import slot_install_steps
+    return jsonify({"steps": [{"kind": k, "payload": p}
+                              for k, p in slot_install_steps()]})
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Central-driven worker install.
 #
 # An operator on a GPU box runs ONE command; everything else (where to find the

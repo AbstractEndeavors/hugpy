@@ -501,8 +501,28 @@ class OffDriver:
 # --------------------------------------------------------------------------- #
 
 def serve_endpoint(model_key) -> Optional[str]:
-    """Base URL the HTTP runner should hit, or None for in-process."""
+    """Base URL the HTTP runner should hit, or None for in-process.
+
+    For llama.cpp models the slot pool is preferred: a free/loaded slot serves
+    the model on the GPU, and only when every slot is busy do we fall back to
+    the swap proxy (the configured overflow). Non-llama models stay in-process.
+    """
     spec = serve_spec_for(model_key)
+    if spec.mode is ServeMode.OFF:
+        return None
+
+    try:
+        from .slots import SlotPool, slots_enabled
+        if slots_enabled():
+            endpoint = SlotPool().endpoint_for(model_key)
+            if endpoint:
+                return endpoint
+            logger.info("all slots busy; routing %s via swap proxy", model_key)
+            return f"http://{LLAMA_SWAP_HOST}:{LLAMA_SWAP_PORT}"
+    except Exception as exc:  # never let slot scheduling break serving
+        logger.warning("slot routing failed for %s: %s; using %s",
+                       model_key, exc, spec.mode.value)
+
     return get_serve_driver(spec.mode).endpoint(spec)
 
 
