@@ -200,9 +200,14 @@ def _ensure_present(payload: dict, central_url: str | None) -> None:
     if not model_key:
         return
     try:
-        from .provision import ensure_model_present
+        from .provision import ensure_model_present, ensure_model_registered
 
-        ensure_model_present(model_key, central_url)
+        # Learn the model from central if the worker wasn't built with it, then
+        # run inference against the canonical local key.
+        canonical = ensure_model_registered(model_key, central_url)
+        if canonical and canonical != model_key:
+            payload["model_key"] = canonical
+        ensure_model_present(payload.get("model_key"), central_url)
     except Exception as exc:
         logger.warning("provisioning check for %s failed: %s", model_key, exc)
 
@@ -217,7 +222,16 @@ def _ensure_present_streaming(payload: dict, central_url: str | None):
     if not model_key:
         return
     try:
-        from .provision import ensure_model_present, model_is_local
+        from .provision import (
+            ensure_model_present, ensure_model_registered, model_is_local,
+        )
+
+        # Learn the model from central first, then work the rest of the stream
+        # against the canonical local key (so resolution/loading can find it).
+        canonical = ensure_model_registered(model_key, central_url)
+        if canonical and canonical != model_key:
+            payload["model_key"] = canonical
+            model_key = canonical
 
         if model_is_local(model_key):
             return  # nothing to do; go straight to generation
@@ -695,13 +709,15 @@ def _probe_model(model_key: str, state: "WorkerState") -> dict:
     before = _free_vram_bytes()
     result: dict = {"model_key": model_key, "vram_free_before": before}
     try:
-        # Make sure the files are present (central-first), then build the runner,
-        # which loads the model. A tiny run confirms it can actually generate.
-        from .provision import ensure_model_present
-        ensure_model_present(model_key, state.central_url)
+        # Learn the model from central (if needed), make sure its files are
+        # present, then build the runner, which loads the model. A tiny run
+        # confirms it can actually generate.
+        from .provision import ensure_model_present, ensure_model_registered
+        canonical = ensure_model_registered(model_key, state.central_url) or model_key
+        ensure_model_present(canonical, state.central_url)
 
         from abstract_hugpy.managers.dispatch import runner_for
-        runner_for(model_key=model_key)  # builds + caches the runner (loads weights)
+        runner_for(model_key=canonical)  # builds + caches the runner (loads weights)
 
         after = _free_vram_bytes()
         used = (before - after) if (before is not None and after is not None) else None

@@ -1,7 +1,14 @@
 """Model provisioning for the worker — central-first, Hugging Face fallback.
 
-When the worker is asked to serve a model it doesn't have on disk, it tries to
-fetch the files in this order:
+The worker ships with only a small curated model registry; CENTRAL is the
+source of truth for what models exist. So before any files are fetched, the
+worker first makes sure it KNOWS the model — pulling the model's config row
+from central and registering it into the worker's own in-memory registry
+(:func:`ensure_model_registered`). Without that step a model central assigns
+but the worker wasn't built with fails to even resolve ("Unknown model_key=
+None") and to provision ("Unknown model").
+
+Once the model is known, its files are fetched in this order:
 
     1. From the CENTRAL node, over WireGuard, using the read-only endpoints
        /api/llm/models/<key>/manifest and /api/llm/models/<key>/file. This needs
@@ -26,6 +33,126 @@ import urllib.error
 logger = logging.getLogger("abstract_hugpy.worker_agent.provision")
 
 _CHUNK = 8 * 1024 * 1024  # 8 MiB streaming chunks
+
+
+# ---------------------------------------------------------------------------
+# Registry sync — teach the worker about a model it wasn't built with.
+# ---------------------------------------------------------------------------
+def _clean_hub(value) -> str:
+    """Normalise a hub_id for comparison (strip storage-path leakage)."""
+    try:
+        from abstract_hugpy.imports.config.models import models_config as mc
+        return mc._clean_repo_id(value)
+    except Exception:
+        return str(value or "").strip("/")
+
+
+def _assure_local_key(model_key: str):
+    """Canonical local registry key for model_key (key/hub_id/suffix), or None."""
+    try:
+        from abstract_hugpy.managers.resolvers.assure_model_key import assure_model_key
+        return assure_model_key(model_key)
+    except Exception:
+        return None
+
+
+def _fetch_central_model_row(central_url: str, model_key: str) -> dict | None:
+    """Pull one model's config row from central by key, else by scanning the list.
+
+    Central keys its registry by a short name (e.g. ``DAN-Qwen3-1.7B``) while an
+    inference request may carry the hub_id (``UnfilteredAI/DAN-Qwen3-1.7B``), so
+    a direct ``/models/<key>`` lookup can miss — we then scan ``/models`` and
+    match on key or cleaned hub_id.
+    """
+    base = central_url.rstrip("/") + "/api/llm/models"
+
+    # 1) direct config endpoint (works when model_key is central's own key)
+    try:
+        row = _get_json(base + "/" + urllib.parse.quote(model_key, safe=""))
+        if isinstance(row, dict) and (row.get("key") or row.get("model_key")
+                                      or row.get("hub_id")):
+            return row
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (404, 409):
+            logger.warning("central model lookup %s: HTTP %s", model_key, exc.code)
+    except Exception as exc:
+        logger.warning("central model lookup %s failed: %s", model_key, exc)
+
+    # 2) scan the full list, match by key or cleaned hub_id
+    try:
+        listing = _get_json(base)
+    except Exception as exc:
+        logger.warning("central model list failed: %s", exc)
+        return None
+    if not isinstance(listing, list):
+        return None
+
+    want = _clean_hub(model_key)
+    for row in listing:
+        if not isinstance(row, dict):
+            continue
+        if (row.get("key") or row.get("model_key")) == model_key:
+            return row
+        if want and _clean_hub(row.get("hub_id")) == want:
+            return row
+    return None
+
+
+def _register_local_model(model_key: str, row: dict) -> bool:
+    """Insert a central-provided model row into the worker's live registry.
+
+    Mutates MODEL_REGISTRY / MODEL_REGISTRY_DICT in place so every holder of
+    those dicts (resolver, loader, get_model_config) immediately sees the model.
+    """
+    try:
+        from abstract_hugpy.imports.config.models import models_config as mc
+    except Exception as exc:
+        logger.warning("cannot access local registry to register %s: %s", model_key, exc)
+        return False
+    try:
+        cfg, why = mc.derive_model_config_row(model_key, dict(row))
+        if cfg is None:
+            logger.warning("central row for %s not directly usable (%s); "
+                           "registering raw", model_key, why)
+            cfg = dict(row)
+            cfg.setdefault("model_key", model_key)
+        mc.update_model_config_dict(model_key=model_key, values=cfg,
+                                    dict_obj=mc.MODEL_REGISTRY)
+        mc.update_model_config_dict(model_key=model_key, values=cfg,
+                                    dict_obj=mc.MODEL_REGISTRY_DICT, dict_return=True)
+        if model_key in mc.MODEL_REGISTRY:
+            logger.info("registered model %s from central into local registry", model_key)
+            return True
+        logger.warning("registration of %s did not stick (failed assessment)", model_key)
+        return False
+    except Exception as exc:
+        logger.warning("failed to register %s locally: %s", model_key, exc)
+        return False
+
+
+def ensure_model_registered(model_key: str, central_url: str | None) -> str | None:
+    """Make sure ``model_key`` exists in the worker's LOCAL registry.
+
+    Accepts a registry key OR a hub_id. If the worker already knows it,
+    returns the canonical local key. Otherwise pulls the config row from
+    central and registers it. Returns the canonical local key, or None if the
+    model can't be learned (no central / central doesn't have it).
+    """
+    local = _assure_local_key(model_key)
+    if local:
+        return local
+    if not central_url:
+        return None
+
+    row = _fetch_central_model_row(central_url, model_key)
+    if not row:
+        logger.warning("central has no config for %s; cannot register", model_key)
+        return None
+
+    key = row.get("key") or row.get("model_key") or model_key
+    if _register_local_model(key, row):
+        return _assure_local_key(key) or key
+    return None
 
 
 def model_is_local(model_key: str) -> bool:
@@ -173,22 +300,27 @@ def ensure_model_present(model_key: str, central_url: str | None, progress=None)
     download so callers can stream provisioning status. Returns True if the
     model is present (or already was), False if it could not be provisioned.
     """
-    if model_is_local(model_key):
+    # Teach the worker about the model first (central is the source of truth),
+    # then provision against the canonical local key. This is what lets the
+    # worker serve a model it wasn't built with.
+    canonical = ensure_model_registered(model_key, central_url) or model_key
+
+    if model_is_local(canonical):
         return True
 
     if central_url:
         try:
-            if fetch_from_central(central_url, model_key, progress=progress):
+            if fetch_from_central(central_url, canonical, progress=progress):
                 return True
         except Exception as exc:
-            logger.warning("central provisioning of %s failed: %s; trying HF", model_key, exc)
+            logger.warning("central provisioning of %s failed: %s; trying HF", canonical, exc)
 
     try:
         if progress:
             progress(0, 0, "huggingface")
-        fetch_from_hf(model_key)
+        fetch_from_hf(canonical)
         return True
     except Exception as exc:
-        logger.error("could not provision %s from HF: %s", model_key, exc)
+        logger.error("could not provision %s from HF: %s", canonical, exc)
         return False
 
