@@ -105,8 +105,17 @@ class LlamaCppBaseRunner(ABC):
         cancel_event: Optional[asyncio.Event] = None,
         *,
         chunk_tokens: int = 1024,
-        max_chunks: int = 8,
+        max_chunks: int = None,
     ) -> AsyncIterator[StreamEvent]:
+        import os as _os
+        if max_chunks is None:
+            # High ceiling so "unbounded" really means until-the-model-stops,
+            # not a hidden 8-chunk cap. Still bounded so a looping model can't
+            # run forever. Override with HUGPY_MAX_CHUNKS.
+            try:
+                max_chunks = int(_os.environ.get("HUGPY_MAX_CHUNKS", "256"))
+            except ValueError:
+                max_chunks = 256
         temp     = resolve_temperature(req.temperature, req.do_sample)
         top_p    = resolve_top_p(req.top_p)
         convo    = messages_to_dicts(req.messages)
@@ -170,8 +179,14 @@ class LlamaCppBaseRunner(ABC):
         return text
 
     def generate_text_unbounded(self, messages, *, chunk_tokens=1024,
-                                max_chunks=8, temperature=0.0, top_p=1.0,
+                                max_chunks=None, temperature=0.0, top_p=1.0,
                                 do_sample=False, stop=None, **_) -> str:
+        import os as _os
+        if max_chunks is None:
+            try:
+                max_chunks = int(_os.environ.get("HUGPY_MAX_CHUNKS", "256"))
+            except ValueError:
+                max_chunks = 256
         temp      = resolve_temperature(temperature, do_sample)
         top_p_val = resolve_top_p(top_p)
         accumulated = ""

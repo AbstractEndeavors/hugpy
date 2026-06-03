@@ -121,10 +121,16 @@ def _resolve_max_new_tokens(body: ChatBody) -> int:
 async def stream_events(body: ChatBody):
     from abstract_hugpy.managers.dispatch import execute_prompt
 
-    prompt_kwargs = {
-        "max_new_tokens": _resolve_max_new_tokens(body),
-    }
-
+    prompt_kwargs = {}
+    if body.max_new_tokens:
+        # Explicit cap from the client -> honor it (bounded, per-call).
+        prompt_kwargs["max_new_tokens"] = body.max_new_tokens
+    else:
+        # No cap requested -> run unbounded: the runner generates chunk-by-chunk
+        # until the model naturally stops, so the response is never truncated by
+        # a token limit. (Per-chunk size uses the model's context.)
+        prompt_kwargs["unbounded"] = True
+        prompt_kwargs["max_new_tokens"] = _resolve_max_new_tokens(body)
 
     if body.model_key:
         prompt_kwargs["model_key"] = body.model_key

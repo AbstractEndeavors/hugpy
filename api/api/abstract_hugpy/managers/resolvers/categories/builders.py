@@ -33,10 +33,15 @@ def _build_chat_request(kwargs: Dict[str, Any], model_key: str) -> ChatRequest:
             f"got keys: {sorted(kwargs)}"
         )
 
-    for k in ("max_new_tokens", "temperature", "top_p", "do_sample", "request_id"):
+    for k in ("max_new_tokens", "temperature", "top_p", "do_sample", "request_id", "unbounded"):
         if k in kwargs:
             out[k] = kwargs[k]
     out.setdefault("request_id", make_request_id())
+    # Default chat to unbounded so the runner keeps generating until the model
+    # naturally stops, instead of truncating at a single token cap. Callers can
+    # still force a bounded response with unbounded=False / a max_new_tokens cap.
+    if "unbounded" not in out and not kwargs.get("max_new_tokens"):
+        out["unbounded"] = True
     return ChatRequest(**out)
 
 
