@@ -2,6 +2,7 @@
   "name": "llm-console-ui",
   "version": "0.1.0",
   "private": true,
+  "description": "Web console for abstractgpt — a self-hosted, GPU-pooling inference platform for open-source LLMs and vision models: manage models, donate/assign GPUs, and chat, all on hardware you control.",
   "type": "module",
   "scripts": {
     "dev": "webpack serve --mode development",
