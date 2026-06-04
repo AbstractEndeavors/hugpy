@@ -1,7 +1,7 @@
-# abstractgpt
+# hugpy
 
 > **Self-hosted, GPU-pooling inference for open-source LLMs and vision models.**
-> abstractgpt turns the hardware you already own — a workstation, a gaming
+> hugpy turns the hardware you already own — a workstation, a gaming
 > laptop, GPUs on another network, even a rack of Android phones — into one
 > managed inference cluster behind a single web console. Central distributes the
 > models, fills each GPU on demand, and degrades gracefully (CPU spill,
@@ -22,7 +22,7 @@ parts of using them are operational, not theoretical:
 - standing up model servers without hand-editing systemd units as root,
 - keeping a long conversation from blowing past a model's context window.
 
-abstractgpt solves these so a heterogeneous pile of hardware behaves like one
+hugpy solves these so a heterogeneous pile of hardware behaves like one
 inference endpoint.
 
 ---
