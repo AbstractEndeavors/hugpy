@@ -1,44 +1,40 @@
 #!/usr/bin/env bash
 #
-# pull-from-main.sh — deploy the latest origin/main into this NON-git checkout.
+# pull-from-main.sh — deploy the latest origin/main into the /srv/hugpy checkout.
 #
-# /srv/abstractgpt/abstractgpt is a plain directory (no .git), so we can't
-# git-pull in place. Instead we clone origin/main to a temp dir and swap in the
-# fresh api/ and app/.
+# /srv/hugpy is a real git repo (it has .git), so we update it IN PLACE: fetch
+# origin/main and hard-reset onto it. This discards any uncommitted edits to
+# tracked files — commit/push them with ./scripts/push-to-main.sh first if you
+# want to keep them. Untracked/ignored runtime dirs (logs/, run/, backups/,
+# miniforge3/, .env, …) are left untouched.
 #
 # Steps:
-#   1. Shallow-clone origin/main to a temp dir; verify it has api/ and app/.
-#   2. Snapshot the current api/ and app/ into prev/<timestamp>/ (rollback).
-#   3. Swap the fresh api/ and app/ into place.
+#   1. Fetch origin/main (retry on transient network failures).
+#   2. Record the current revision for one-command rollback.
+#   3. Hard-reset the working tree to origin/main.
 #   4. Build the frontend (yarn && yarn build).
-#   5. Restart the API service (streams the rolling log).
-#
-# The clone happens BEFORE we touch the running copy, so a failed/empty clone
-# never leaves the site without api/ or app/.
+#   5. Restart the API service.
 #
 #   ./scripts/pull-from-main.sh
-#   ROOT=/some/path REPO_URL=git@github.com:AbstractEndeavors/abstractgpt.git ./scripts/pull-from-main.sh
+#   REPO=/some/path SERVICE=6092_hugpy_api ./scripts/pull-from-main.sh
 #
 set -euo pipefail
 
-ROOT="${ROOT:-/srv/abstractgpt/abstractgpt}"
-# SSH by default — GitHub no longer accepts password auth over HTTPS, so a
-# bare HTTPS URL just prompts forever on a server. Override with REPO_URL for
-# an HTTPS+token remote, e.g.
-#   REPO_URL=https://<user>:<token>@github.com/AbstractEndeavors/abstractgpt.git
-REPO_URL="${REPO_URL:-git@github.com:AbstractEndeavors/abstractgpt.git}"
+REPO="${REPO:-/srv/hugpy}"
 BRANCH="${BRANCH:-main}"
-SERVICE="${SERVICE:-6092_abstractgpt_api}"
-TS="$(date '+%Y%m%d_%H%M%S')"
-PREV="$ROOT/prev/$TS"
+# Name of the systemd-ish unit restarted at the end. The old abstractgpt deploy
+# used 6092_abstractgpt_api; adjust to your real hugpy unit, or override with
+#   SERVICE=<name> ./scripts/pull-from-main.sh
+SERVICE="${SERVICE:-6092_hugpy_api}"
 
 # Never block on an interactive credential prompt — fail fast with guidance
 # instead of looping forever asking for a username/password.
 export GIT_TERMINAL_PROMPT=0
 
-# Use a specific (passwordless) deploy key if present, so the clone works
+# Use a specific (passwordless) deploy key if present, so the fetch works
 # without a configured ~/.ssh/config and without an ssh-agent. Falls back to
-# the default ssh resolution when the key file isn't there.
+# the default ssh resolution when the key file isn't there. Only applies to
+# SSH remotes; HTTPS+token remotes ignore it.
 DEPLOY_SSH_KEY="${DEPLOY_SSH_KEY:-/home/op/.ssh/github/githubssh_nopass}"
 if [[ -z "${GIT_SSH_COMMAND:-}" ]]; then
   if [[ -f "$DEPLOY_SSH_KEY" ]]; then
@@ -48,73 +44,59 @@ if [[ -z "${GIT_SSH_COMMAND:-}" ]]; then
   fi
 fi
 
-if [[ ! -d "$ROOT" ]]; then
-  echo "error: $ROOT does not exist" >&2
+cd "$REPO"
+
+# Must be a git repo.
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "error: $REPO is not a git repository" >&2
   exit 1
 fi
 
-# Temp clone dir on the same filesystem as ROOT so the final swap is a fast mv.
-TMP="$(mktemp -d "$ROOT/.deploy.XXXXXX")"
-cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT
-
-# 1. Clone latest main (retry on transient network failures).
-echo "Cloning $REPO_URL ($BRANCH)…"
+# 1. Fetch latest main (retry on transient network failures).
+echo "Fetching origin/$BRANCH…"
 n=0
-until git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TMP/repo"; do
+until git fetch origin "$BRANCH"; do
   n=$((n + 1))
   if (( n > 4 )); then
-    echo "error: git clone failed." >&2
+    echo "error: git fetch failed after retries." >&2
     cat >&2 <<EOF
 
 Authentication likely failed. GitHub does NOT accept account passwords for git.
 Pick one:
   • SSH (recommended): ensure 'ssh -T git@github.com' greets you, then re-run.
-  • HTTPS + token: re-run with a Personal Access Token (repo scope), e.g.
-      REPO_URL=https://putkoff:<TOKEN>@github.com/AbstractEndeavors/abstractgpt.git \\
-        ./scripts/pull-from-main.sh
+  • HTTPS + token: set the remote to an https URL with a Personal Access Token
+    (repo scope), e.g.
+      git -C $REPO remote set-url origin \\
+        https://putkoff:<TOKEN>@github.com/AbstractEndeavors/hugpy.git
 The username is always your personal account (putkoff), not the org.
 EOF
     exit 1
   fi
-  echo "clone failed (attempt $n), retrying…"; rm -rf "$TMP/repo"; sleep $((2 ** n))
+  echo "fetch failed (attempt $n), retrying…"; sleep $((2 ** n))
 done
 
-# Verify the clone actually contains what we're about to deploy.
-for d in api app; do
-  if [[ ! -d "$TMP/repo/$d" ]]; then
-    echo "error: cloned repo is missing $d/ — aborting before touching live files" >&2
-    exit 1
-  fi
-done
-NEW_REV="$(git -C "$TMP/repo" rev-parse --short HEAD)"
+OLD_REV="$(git rev-parse --short HEAD)"
+NEW_REV="$(git rev-parse --short FETCH_HEAD)"
 
-# 2. Snapshot the currently-deployed api/ and app/ before replacing them.
-echo "Backing up current api/ and app/ -> $PREV"
-mkdir -p "$PREV"
-for d in api app; do
-  if [[ -e "$ROOT/$d" ]]; then
-    mv "$ROOT/$d" "$PREV/$d"
-  else
-    echo "  note: $d/ does not exist yet (nothing to back up)"
-  fi
-done
-
-# 3. Swap the fresh api/ and app/ into place.
-echo "Installing fresh api/ and app/ from $NEW_REV…"
-mv "$TMP/repo/api" "$ROOT/api"
-mv "$TMP/repo/app" "$ROOT/app"
+if [[ "$OLD_REV" == "$NEW_REV" ]]; then
+  echo "Already at origin/$BRANCH ($NEW_REV) — nothing to deploy."
+else
+  # 2 & 3. Reset the working tree to the freshly fetched origin/main.
+  echo "Deploying $OLD_REV -> $NEW_REV (hard reset to origin/$BRANCH)…"
+  git reset --hard FETCH_HEAD
+  echo "Rollback if needed:  git -C $REPO reset --hard $OLD_REV"
+fi
 
 # 4. Build the frontend.
 echo "Building frontend…"
-cd "$ROOT/app"
+cd "$REPO/app"
 yarn
 yarn build
 
-echo "✓ Deployed $BRANCH ($NEW_REV). Rollback snapshot: $PREV"
+echo "✓ Deployed $BRANCH ($(git -C "$REPO" rev-parse --short HEAD))."
 
-# 5. Restart the API service. This streams the rolling log and blocks, so it
+# 5. Restart the API service. This may stream the rolling log and block, so it
 #    goes last — keep nothing after it.
 echo "Restarting service $SERVICE…"
-cd "$ROOT"
+cd "$REPO"
 restart_view_service "$SERVICE"

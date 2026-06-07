@@ -2,17 +2,17 @@
 #
 # push-to-main.sh — commit everything in this repo and push it to origin/main.
 #
-# Built for the server checkout at /srv/abstractgpt/abstractgpt where files get
-# edited in place. Run it with an optional commit message:
+# Built for the server checkout at /srv/hugpy where files get edited in place.
+# Run it with an optional commit message:
 #
-#     ./scripts/push-to-main.sh "fix peer_for + worker tweaks"
+#     ./scripts/push-to-main.sh "fix slot autofit + worker tweaks"
 #
 # With no message it uses a timestamped default. Override the repo path with
 # REPO=/some/path ./scripts/push-to-main.sh
 #
 set -euo pipefail
 
-REPO="${REPO:-/srv/abstractgpt/abstractgpt}"
+REPO="${REPO:-/srv/hugpy}"
 BRANCH="main"
 MSG="${*:-deploy: $(date '+%Y-%m-%d %H:%M:%S %Z')}"
 
