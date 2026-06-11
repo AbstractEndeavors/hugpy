@@ -3,3 +3,4 @@ from .chat_routes import chat_bp
 from .search_routes import search_bp
 from .upload_routes import upload_bp
 from .worker_routes import worker_bp
+from .shard_queue_routes import shard_queue_bp

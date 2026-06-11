@@ -1,0 +1,105 @@
+/* SharedQueuePanel — visual language follows WorkersPanel/PeersBar:
+   a slim collapsible band under the workers strip. */
+
+.sqp {
+  border-bottom: 1px solid var(--border, #243040);
+  background: var(--surface-1, #131820);
+}
+
+.sqp-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.sqp-title { font-weight: 600; font-size: 13px; }
+.sqp-count { color: var(--dim, #7d8da1); font-size: 12px; }
+.sqp-fold  { margin-left: auto; color: var(--dim, #7d8da1); }
+
+.sqp-body { padding: 0 16px 12px; }
+
+.sqp-form { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+
+.sqp-form textarea {
+  background: var(--surface-2, #1a212c);
+  border: 1px solid var(--border, #243040);
+  border-radius: 8px;
+  color: inherit;
+  padding: 8px 10px;
+  font: inherit;
+  resize: vertical;
+}
+
+.sqp-form-row { display: flex; gap: 8px; align-items: center; }
+
+.sqp-form-row select {
+  flex: 1;
+  background: var(--surface-2, #1a212c);
+  border: 1px solid var(--border, #243040);
+  border-radius: 8px;
+  color: inherit;
+  padding: 7px 8px;
+  font-size: 13px;
+}
+
+.sqp-job {
+  border: 1px solid var(--border, #243040);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  background: var(--surface-2, #1a212c);
+}
+
+.sqp-job-top { display: flex; gap: 8px; align-items: center; }
+
+.sqp-prompt {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sqp-sub { color: var(--dim, #7d8da1); font-size: 12px; margin-top: 3px; }
+
+.sqp-chip {
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.sqp-queued    { background: rgba(125, 141, 161, .18); color: #7d8da1; }
+.sqp-running   { background: rgba(86, 212, 232, .15);  color: #56d4e8; }
+.sqp-done      { background: rgba(90, 216, 138, .15);  color: #5ad88a; }
+.sqp-error,
+.sqp-cancelled { background: rgba(232, 101, 122, .15); color: #e8657a; }
+
+.sqp-result {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, .35);
+  border-radius: 8px;
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  max-height: 280px;
+  overflow: auto;
+}
+
+.sqp-err { color: #e8657a; }
+
+.sqp-empty { color: var(--dim, #7d8da1); font-size: 13px; }
+
+.sqp-ghost {
+  background: transparent;
+  color: var(--dim, #7d8da1);
+  border: 1px solid var(--border, #243040);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.sqp-ghost:hover { color: inherit; }

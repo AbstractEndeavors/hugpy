@@ -6,7 +6,7 @@ import { AuthProvider } from './../Auth/AuthProvider'
 import { PrivateRoute } from './../Auth/PrivateRoute'
 import { LoginForm } from './../Auth/LoginForm'
 
-import {ModelTable,ChatPanel,HFSearch,PeersBar,WorkersPanel} from './../components';
+import {ModelTable,ChatPanel,HFSearch,PeersBar,WorkersPanel,SharedQueuePanel} from './../components';
 import './App.css'
 export function Console() {
   const [models, setModels]         = useState([])
@@ -152,6 +152,7 @@ export function Console() {
 
       <PeersBar />
       <WorkersPanel models={models} />
+      <SharedQueuePanel models={models} />
       <HFSearch
         onJobStarted={handleHFJobStarted}
         onCancelJob={cancelJob}
