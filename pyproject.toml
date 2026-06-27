@@ -1,0 +1,90 @@
+# hugpy — self-hosted LLM console.
+# Prod packaging for the `hugpy` package (the prod twin of the dev module,
+# mirrored + renamed by hugpy_release/sync_prod_hugpy.sh). Source-available
+# license to start; may ease later.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hugpy"
+version = "0.1.49"
+description = "Self-hosted LLM console: model registry & downloads, streaming chat, OpenAI-compatible /v1 API with on-site keys, GPU worker fleet with cross-machine RPC sharding"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "putkoff" }]
+license = { file = "LICENSE" }
+classifiers = ["License :: Other/Proprietary License"]
+keywords = ["llm", "llama.cpp", "transformers", "self-hosted", "openai-compatible"]
+
+# Base = what the web app needs to import and serve, PLUS a working in-process
+# GGUF engine on every OS. llama-cpp-python ships prebuilt wheels for
+# Linux/macOS/Windows, so `pip install hugpy` gives chat out of the box with no
+# cmake; the native llama-server binary (for the always-on serve/fleet path) is
+# fetched on demand by `hugpy install-engine`. Heavier inference stacks
+# (torch/transformers) stay extras so a coordinator-only install stays light.
+dependencies = [
+    "flask",
+    # gunicorn is POSIX-only; on Windows we serve via waitress (see below). The
+    # CLI already falls back to the Flask dev server if neither is present.
+    "gunicorn; platform_system != 'Windows'",
+    "waitress; platform_system == 'Windows'",
+    "pydantic>=2",
+    "httpx",
+    "aiohttp",
+    "requests",
+    "psutil",
+    "platformdirs",          # per-OS data/config/cache/engine dirs
+    "pyyaml",
+    "numpy<2.4",
+    "pillow",
+    "huggingface_hub",
+    "bcrypt",
+    "llama-cpp-python",      # in-process GGUF engine — the portable baseline
+    "abstract_apis",
+    "abstract_flask",
+    "abstract_security",
+    "abstract_utilities",
+    "abstract_webtools",
+    "abstract_ocr",
+    "opencv-python-headless",
+    "PyPDF2",
+    "pdfplumber",
+    "onnxruntime",
+    "pytest",                # abstract_ocr imports it at module level
+]
+
+[project.optional-dependencies]
+transformers = ["torch", "transformers", "accelerate"]
+# `llama` is now part of the base install; the extra remains as a no-op alias so
+# existing `pip install hugpy[llama]` / `hugpy[all]` lines keep working. For a
+# CUDA-accelerated build, reinstall with:
+#   CMAKE_ARGS="-DGGML_CUDA=on" pip install --force-reinstall --no-cache-dir llama-cpp-python
+llama = []
+gpu = ["pynvml"]             # optional richer GPU probing (falls back to nvidia-smi)
+embed = ["sentence-transformers"]
+finetune = ["peft"]
+all = ["hugpy[transformers,llama,embed,finetune,gpu]"]
+
+[project.urls]
+Homepage = "https://hugpy.ai"
+Source = "https://github.com/hugpy/hugpy/tree/main/api"
+
+[project.scripts]
+hugpy = "hugpy.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["hugpy*"]
+
+# The built web console rides inside the wheel so `pip install hugpy` is the
+# whole product. Refresh before release: npm run build in ui/, then
+# cp -r ui/dist api/api/hugpy/console_dist
+[tool.setuptools.package-data]
+hugpy = ["console_dist/**/*"]
+
+[tool.pypit]
+# hugpy's GitHub source is the hugpy/hugpy mono-repo (api/ subtree), mirrored by
+# hugpy_release/mirror_github_suite.sh — NOT pypit's repo-root push.
+github_push = false
+github_owner = "hugpy"
