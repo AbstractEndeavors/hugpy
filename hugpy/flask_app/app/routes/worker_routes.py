@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 from flask import request, jsonify, abort, send_file, Response
 
 from .imports import *
-from ....managers.serve.overrides import get_override, set_override, available_gguf_files
+from ....managers.serve.overrides import get_override, set_override, available_gguf_files, all_overrides
 # Serving/slot drivers: imported at module scope (the route handlers below call
 # these by bare name). They are not on the functions star re-export chain.
 from ....managers.serve.serve import (
@@ -467,6 +467,128 @@ def workers_probe(worker_id):
                         "error": f"{type(exc).__name__}: {exc}"})
 
 
+# ── worker slots: VRAM-fit preflight + load (the GPU analog of /llm/slots) ──
+#
+# The local slot pool refuses a model that won't fit RAM before it OOMs the box
+# (slot_agent._build_cmd preflight). Worker slots do the same against a worker's
+# free VRAM: a cheap, instant central-side reject so a too-big model never even
+# reaches the card. The flat vram_free now on every worker record (_vram_summary)
+# is what makes this a one-line comparison instead of a heavy live probe.
+
+# VRAM need over the raw GGUF size: weights resident on the GPU plus kv-cache /
+# context and CUDA runtime overhead. A need-side multiplier (overhead scales with
+# the model), the VRAM counterpart of the local preflight's 0.95 fill guard.
+VRAM_HEADROOM = float(os.environ.get("HUGPY_VRAM_HEADROOM", "1.15"))
+
+
+def _model_gguf_bytes(model_key):
+    """Total on-disk GGUF size for a model (sums all shards), or None if unknown.
+
+    ``_model_file_for`` and ``_total_gguf_bytes`` are underscore-private, so they
+    are NOT pulled in by ``from .imports import *`` — import them explicitly here
+    (a bare reference would NameError and, caught below, silently read as None)."""
+    try:
+        from ....managers.serve.serve import _model_file_for
+        from ....managers.serve.slot_agent import _total_gguf_bytes
+        src = _model_file_for(model_key, get_model_config(model_key))
+    except Exception:
+        return None
+    if not src:
+        return None
+    try:
+        return _total_gguf_bytes(src)
+    except Exception:
+        return None
+
+
+def _worker_fit(model_key, worker):
+    """Capacity preflight for placing a model on a worker — the GPU analog of the
+    local RAM preflight, but DUAL. A GPU worker holds weights in VRAM and can
+    spill the remainder to host RAM, so a load only truly *fails* when the model
+    exceeds BOTH combined — that's what we block on. Separately we flag whether it
+    fits VRAM outright (``gpu_resident``) vs would partially offload to CPU
+    (slower), so the UI can warn without refusing.
+
+    Why dual: a worker like an 8 GB card on a 16 GB box can't be judged on VRAM
+    alone — a model bigger than VRAM may still load (spilling to RAM), and one
+    bigger than VRAM+RAM can't load at all. ``fit=None`` when the model can't be
+    sized (then we don't block — defer to the live load). All byte counts."""
+    need_raw = _model_gguf_bytes(model_key)
+    vram = worker.get("vram_free")
+    ram = worker.get("free_ram")
+    gib = float(2 ** 30)
+    if need_raw is None:
+        return {"fit": None, "gpu_resident": None, "need": None, "need_raw": None,
+                "vram_free": vram, "ram_free": ram, "reason": "model size unknown — not preflighted"}
+    need = int(need_raw * VRAM_HEADROOM)
+    capacity = (vram or 0) + (ram or 0)
+    fit = (need_raw <= capacity) if capacity else None
+    gpu_resident = (vram is not None) and (need <= vram)
+    where = worker.get("gpu") or "this worker"
+    if fit is False:
+        reason = (f"won't fit {where}: model is {need_raw/gib:.1f} GiB but only "
+                  f"{(vram or 0)/gib:.1f} GiB VRAM + {(ram or 0)/gib:.1f} GiB RAM free "
+                  f"({capacity/gib:.1f} GiB total)")
+    elif fit and not gpu_resident:
+        reason = (f"fits but would partially offload to CPU: needs ~{need/gib:.1f} GiB, "
+                  f"only {(vram or 0)/gib:.1f} GiB VRAM free on {where} — slower than GPU-resident")
+    else:
+        reason = None
+    return {"fit": fit, "gpu_resident": gpu_resident, "need": need, "need_raw": need_raw,
+            "vram_free": vram, "ram_free": ram, "capacity": capacity,
+            "headroom": VRAM_HEADROOM, "reason": reason}
+
+
+@worker_bp.route("/llm/workers/<worker_id>/load", methods=["POST"])
+def workers_load(worker_id):
+    """Place a model on a GPU worker: VRAM preflight → assign → load into VRAM.
+
+    The worker-slot analog of /llm/slots/load. Refuses cleanly (409) when the
+    model won't fit the worker's free VRAM, instead of letting it OOM the card.
+    On a pass it assigns the model (registry) and kicks a best-effort warm on the
+    worker so it becomes GPU-resident. The warm is BACKGROUND: loading a model can
+    take minutes (the worker's /probe loads it synchronously), and the request
+    must not block — the local slot loader is async for the same reason. The UI
+    reflects residency from the worker's heartbeat (loaded_models), polling
+    /llm/workers; if the warm fails, the next inference lazy-loads it anyway.
+
+    Body: {model_key, spill?, force?}. force=true skips the preflight (still
+    bounded by the worker's own limits)."""
+    import httpx
+    import threading
+
+    raw = request.get_json(silent=True) or {}
+    body = AssignRequest(**raw)
+    force = bool(raw.get("force"))
+    if body.model_key not in get_models_dict(dict_return=True):
+        abort(404, description="Unknown model key.")
+    worker = get_worker(worker_id)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+
+    verdict = _worker_fit(body.model_key, worker)
+    if verdict.get("fit") is False and not force:
+        # `error` so the shared fetchJson surfaces the human reason (it only reads
+        # error/detail/message); `reason`+`preflight` kept for programmatic use.
+        return jsonify({"loaded": False, "error": verdict["reason"],
+                        "reason": verdict["reason"], "preflight": verdict}), 409
+
+    # passed (or forced/undecided) → assign, then warm in the background
+    assign_model(worker_id, body.model_key, spill=body.spill)
+    url = (worker.get("url") or "").rstrip("/") + "/probe/" + body.model_key
+
+    def _warm():
+        try:
+            httpx.post(url, timeout=900.0)  # worker loads synchronously; can be slow
+        except Exception:
+            pass  # best-effort — lazy-load on first inference covers a warm failure
+
+    threading.Thread(target=_warm, name=f"warm-{worker_id[:8]}", daemon=True).start()
+    return jsonify({"loaded": "loading", "assigned": True, "preflight": verdict,
+                    "worker": get_worker(worker_id),
+                    "note": "assigned + warming on the worker — watch loaded_models for residency"})
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Package distribution — central serves the dev wheel as a PEP-503 simple index.
 #
@@ -722,9 +844,66 @@ def _apply_serving(model_key):
     return {"applied": True, "commands": plan.describe()}
 
 
+def _parse_systemd_ts(s):
+    """systemd ActiveEnterTimestamp ('Sat 2026-06-27 08:00:00 UTC') -> epoch secs."""
+    import time, calendar
+    s = (s or "").strip()
+    if not s or s.lower().startswith("n/a"):
+        return None
+    try:
+        p = s.split()                       # [wday, date, time, tz]
+        st = time.strptime(p[1] + " " + p[2], "%Y-%m-%d %H:%M:%S")
+        return int(calendar.timegm(st))     # the timestamps here are UTC
+    except Exception:
+        return None
+
+
+def _unit_live_state(model_key):
+    """Live systemd-unit state for an explicitly-pinned model: is its always-on
+    unit actually running, its cgroup RAM, and since when. Read-only `systemctl
+    show` (no root). {active:None} if the unit/spec can't be resolved."""
+    import subprocess
+    try:
+        unit = serve_spec_for(model_key).unit_name + ".service"
+    except Exception:
+        return {"active": None}
+    try:
+        out = subprocess.run(
+            ["systemctl", "show", unit,
+             "--property=ActiveState,SubState,MemoryCurrent,ActiveEnterTimestamp"],
+            capture_output=True, text=True, timeout=3)
+        kv = {}
+        for line in (out.stdout or "").splitlines():
+            k, _, v = line.partition("=")
+            kv[k] = v
+    except Exception as exc:
+        return {"unit": unit, "active": None, "error": str(exc)}
+    state = kv.get("ActiveState", "") or ""
+    mem = kv.get("MemoryCurrent", "")
+    return {
+        "unit": unit,
+        "state": state,                                  # active|inactive|failed|…
+        "sub_state": kv.get("SubState", "") or "",
+        "active": state == "active",
+        "rss_bytes": int(mem) if mem.isdigit() and int(mem) < (1 << 63) else None,
+        "since": _parse_systemd_ts(kv.get("ActiveEnterTimestamp", "")),
+    }
+
+
 @worker_bp.route("/llm/serving", methods=["GET"])
 def serving_list():
-    return jsonify(serving_overview())
+    # Attach the EXPLICIT override overlay per row so the console can tell a
+    # deliberate pin (operator set serve_mode in serve_overrides.json) from the
+    # registry/env default (DEFAULT_SERVE_MODE=systemd makes every model look
+    # "systemd" otherwise). For pinned rows, also attach live unit state so the
+    # console can show whether the always-on unit is actually running + its RAM.
+    rows = serving_overview()
+    ov = all_overrides()
+    for r in rows:
+        r["override"] = ov.get(r.get("key"), {})
+        if (r.get("override") or {}).get("serve_mode") == "systemd":
+            r["unit"] = _unit_live_state(r.get("key"))
+    return jsonify(rows)
 
 
 def _gguf_choices(model_key):
@@ -774,11 +953,57 @@ def serving_set(model_key):
 # POST /api/llm/slots/unload         {"control": "http://...:8101"}  free a slot
 # GET  /api/llm/slots/install        one-time install steps (dry run; sudo to do)
 # ──────────────────────────────────────────────────────────────────────────
+def _sys_resources():
+    """System RAM (with the used / reclaimable-cache / free split) + cores, read
+    from this VM. `free` semantics: buff/cache = Buffers+Cached+SReclaimable (all
+    reclaimable on demand, already counted in `available`); used = total-free-cache."""
+    import os as _os
+    mem = {}
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                k, _, v = line.partition(":")
+                if k in ("MemTotal", "MemAvailable", "MemFree",
+                         "Buffers", "Cached", "SReclaimable"):
+                    mem[k] = int(v.split()[0]) * 1024
+    except Exception:
+        pass
+    total = mem.get("MemTotal")
+    free = mem.get("MemFree")
+    cache = (mem.get("Buffers") or 0) + (mem.get("Cached") or 0) + (mem.get("SReclaimable") or 0)
+    used = (total - free - cache) if (total is not None and free is not None) else None
+    return {"total_bytes": total,
+            "available_bytes": mem.get("MemAvailable"),
+            "free_bytes": free,
+            "cache_bytes": cache or None,
+            "used_bytes": used,
+            "cpu_count": _os.cpu_count()}
+
+
 @worker_bp.route("/llm/slots", methods=["GET"])
 def slots_overview():
     if not slots_enabled():
-        return jsonify({"enabled": False, "slots": []})
-    return jsonify({"enabled": True, "slots": SlotPool().overview()})
+        return jsonify({"enabled": False, "slots": [], "resources": _sys_resources()})
+    return jsonify({"enabled": True, "slots": SlotPool().overview(),
+                    "resources": _sys_resources()})
+
+
+@worker_bp.route("/llm/free-worker", methods=["POST"])
+def free_worker():
+    """Recycle the API gunicorn worker to release its accumulated in-process RAM
+    (anon memory — e.g. in-process embed/media models, registry caches). Sends a
+    graceful SIGHUP to the gunicorn master: a fresh worker spawns and the old one
+    drains in-flight requests then exits — no root, no dropped service. Slot
+    agents are separate processes and are unaffected. (Reclaimable page cache is
+    NOT this — the kernel frees that on demand; drop_caches isn't needed.)"""
+    import os, signal
+    ppid = os.getppid()
+    try:
+        os.kill(ppid, signal.SIGHUP)
+        return jsonify({"ok": True, "signaled_pid": ppid,
+                        "note": "API worker recycling — reconnect in a few seconds"})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @worker_bp.route("/llm/slots/load", methods=["POST"])
@@ -786,12 +1011,46 @@ def slots_load():
     body = request.get_json(silent=True) or {}
     if not body.get("model_key"):
         return jsonify({"error": "missing model_key"}), 400
-    endpoint = SlotPool().endpoint_for(body["model_key"])
+    # optional per-load compute knobs (blank/omitted = autofit/default)
+    opts = {k: body[k] for k in ("n_gpu_layers", "ctx", "threads", "cpus", "gpu")
+            if body.get(k) not in (None, "")}
+    endpoint = SlotPool().endpoint_for(body["model_key"], opts=opts)
     if endpoint is None:
         return jsonify({"loaded": False, "reason": "all slots busy",
                         "slots": SlotPool().overview()}), 409
     return jsonify({"loaded": True, "endpoint": endpoint,
                     "slots": SlotPool().overview()})
+
+
+@worker_bp.route("/llm/cache", methods=["GET"])
+def cache_status():
+    """SSD hot-cache overview (used/budget/free + cached entries + what's warming)."""
+    from ....managers.serve import model_cache
+    return jsonify(model_cache.status())
+
+
+@worker_bp.route("/llm/cache/warm", methods=["POST"])
+def cache_warm():
+    """Background-warm a model's GGUF onto the SSD cache so its next load is fast.
+    Returns immediately; the copy runs detached (idempotent, single-flight)."""
+    import os as _os
+    from ....managers.serve import model_cache
+    body = request.get_json(silent=True) or {}
+    key = body.get("model_key")
+    if not key:
+        return jsonify({"ok": False, "error": "model_key required"}), 400
+    if not model_cache.enabled():
+        return jsonify({"ok": False, "error": "model cache not enabled on this node"}), 503
+    try:
+        src = _model_file_for(key, get_model_config(key))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 404
+    if not src or not _os.path.isfile(src):
+        return jsonify({"ok": False, "error": f"no gguf on disk for {key}"}), 404
+    if model_cache.is_complete(src):
+        return jsonify({"ok": True, "already_warm": True, "model_key": key})
+    model_cache._warm_async(src)
+    return jsonify({"ok": True, "warming": True, "model_key": key})
 
 
 @worker_bp.route("/llm/slots/unload", methods=["POST"])
@@ -800,7 +1059,11 @@ def slots_unload():
     control = body.get("control")
     if not control:
         return jsonify({"error": "missing control url"}), 400
-    return jsonify(SlotPool().unload(control))
+    try:
+        return jsonify(SlotPool().unload(control))
+    except Exception as exc:  # slot unreachable / mid-load timeout — don't 500 the UI
+        return jsonify({"unloaded": False,
+                        "error": f"{type(exc).__name__}: {exc}"}), 502
 
 
 @worker_bp.route("/llm/slots/install", methods=["GET"])

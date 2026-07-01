@@ -337,7 +337,7 @@ pip install --no-cache-dir pydantic
 ## Links & license
 
 - **Homepage:** https://hugpy.ai
-- **Source:** https://github.com/hugpy/hugpy/tree/main/api
+- **Source:** https://github.com/hugpy/hugpy/tree/main/py
 
 **License:** Source-Available (see `LICENSE`). Copyright © 2026 putkoff
 (hugpy.ai). All rights reserved.

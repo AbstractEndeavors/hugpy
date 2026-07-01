@@ -25,6 +25,8 @@ from functools import wraps
 from flask import Response, jsonify, request, stream_with_context
 
 from ..functions import *  # get_bp, api-key store, chat_iter_sync, get_models_dict, update_model_status, …
+# Default media-chat model_key (single global value); explicit import — not in the functions star-export.
+from ....imports.config.models.models_config import media_default_state
 
 v1_bp, logger = get_bp("v1_bp", __name__)
 
@@ -65,6 +67,7 @@ def v1_auth(fn):
 @v1_auth
 def v1_models():
     manifest = get_models_dict(dict_return=True)
+    media_default = media_default_state()
     data = []
     for key, model in manifest.items():
         model = update_model_status(model)
@@ -78,6 +81,7 @@ def v1_models():
             "hub_id": model.get("hub_id"),
             "task": model.get("primary_task") or model.get("task"),
             "context_length": model.get("model_max_length"),
+            "media_default": (key == media_default),
         })
     return jsonify({"object": "list", "data": data})
 
@@ -115,10 +119,30 @@ def _completion_kwargs(payload: dict) -> dict:
 
 
 async def _v1_events(prompt_kwargs: dict):
-    """Raw StreamEvents from the chat engine (late import dodges circulars)."""
+    """Raw StreamEvents from the chat engine (late import dodges circulars).
+
+    Registered in the live queue (same as the console /chat/stream path) so /v1
+    (OpenAI-compatible) traffic shows in the activity view too. Best-effort —
+    queue bookkeeping must never break a completion."""
     from ..functions.imports import execute_chat_stream
-    async for event in execute_chat_stream(**prompt_kwargs):
-        yield event
+    from hugpy.managers.dispatch import activity
+    rid = prompt_kwargs.get("request_id")
+    mk = prompt_kwargs.get("model_key")
+    name = mk
+    try:
+        from ..functions.imports import get_model_config
+        if mk:
+            name = getattr(get_model_config(mk), "name", None) or mk
+    except Exception:
+        pass
+    activity.begin(rid, mk, name, kind="v1")
+    try:
+        async for event in execute_chat_stream(**prompt_kwargs):
+            if getattr(event, "type", None) == "token":
+                activity.on_token(rid)
+            yield event
+    finally:
+        activity.end(rid)
 
 
 def _finish_reason(reason: str | None) -> str:
